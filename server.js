@@ -11,7 +11,7 @@ const {
   AIRTABLE_API_KEY,
   AIRTABLE_BASE_ID_INDIVIDUAL,
   AIRTABLE_BASE_ID_GLOBAL,
-  SCHOOL_SLUG = 'instruktor' // <— prilagodi svom slugu
+  SCHOOL_SLUG = 'instruktor'
 } = process.env;
 
 if (!OPENAI_API_KEY || !AIRTABLE_API_KEY || !AIRTABLE_BASE_ID_INDIVIDUAL) {
@@ -29,33 +29,84 @@ const atGlobal = AIRTABLE_BASE_ID_GLOBAL
   ? new Airtable({ apiKey: AIRTABLE_API_KEY }).base(AIRTABLE_BASE_ID_GLOBAL)
   : null;
 
-// ---------- Helpers ----------
+/* ---------------- Helpers ---------------- */
+
 async function getSchoolRow() {
-  // Tablica: AUTOŠKOLE | polje: Slug (autoškola)
-  const records = await atIndividual('AUTOŠKOLE')
-    .select({ filterByFormula: `{Slug (autoškola)} = "${SCHOOL_SLUG}"`, maxRecords: 1 })
-    .all();
-  return records[0]?.fields || {};
+  try {
+    const recs = await atIndividual('AUTOŠKOLE')
+      .select({ filterByFormula: `{Slug (autoškola)} = "${SCHOOL_SLUG}"`, maxRecords: 1 })
+      .all();
+    return recs[0]?.fields || {};
+  } catch (e) {
+    console.warn('AUTOŠKOLE_WARN', e.message);
+    return {};
+  }
 }
 
+// “meki” dohvat sporednih tablica (nikad ne ruši)
 async function getTableBySlug(tableName) {
-  // Sve sporedne tablice imaju Lookup polje "Slug" (iz Linka na AUTOŠKOLE)
-  const recs = await atIndividual(tableName)
-    .select({ filterByFormula: `{Slug} = "${SCHOOL_SLUG}"`, maxRecords: 100 })
-    .all();
-  return recs.map(r => r.fields);
+  try {
+    const recs = await atIndividual(tableName)
+      .select({ filterByFormula: `{Slug} = "${SCHOOL_SLUG}"`, maxRecords: 200 })
+      .all();
+    return recs.map(r => r.fields);
+  } catch (e) {
+    console.warn('TABLE_WARN', tableName, e.message);
+    return [];
+  }
 }
 
+/**
+ * GLOBAL: čita sve tablice dinamički preko Meta API-ja,
+ * i iz svake skuplja Q/A u format { title, body }.
+ * Polja koja tražimo: “Naziv rubrike / pitanje”, “Naziv”, “Pitanje” (title)
+ * i “Opis”, “Sadržaj”, “Answer” (body).
+ */
 async function getGlobalBlocks() {
-  if (!atGlobal) return { globalRules: [], glossary: [] };
-  const [rules, glossary] = await Promise.all([
-    atGlobal('GLOBAL – Pravila & FAQ').select({ maxRecords: 50 }).all(),
-    atGlobal('GLOBAL – Pomoćni pojmovi').select({ maxRecords: 200 }).all()
-  ]);
-  return {
-    globalRules: rules.map(r => r.fields),
-    glossary: glossary.map(r => r.fields)
-  };
+  if (!atGlobal || !AIRTABLE_BASE_ID_GLOBAL) return { globalRules: [], glossary: [] };
+  try {
+    // Meta API – popis tablica
+    const metaResp = await fetch(
+      `https://api.airtable.com/v0/meta/bases/${AIRTABLE_BASE_ID_GLOBAL}/tables`,
+      { headers: { Authorization: `Bearer ${AIRTABLE_API_KEY}` } }
+    );
+    const meta = await metaResp.json();
+    if (!meta?.tables?.length) return { globalRules: [], glossary: [] };
+
+    const results = [];
+    for (const t of meta.tables) {
+      try {
+        const recs = await atGlobal(t.name).select({ maxRecords: 500 }).all();
+        for (const r of recs) {
+          const f = r.fields || {};
+          const title =
+            f['Naziv rubrike / pitanje'] ||
+            f['Naziv'] ||
+            f['Pitanje'] ||
+            f['Pojam'] ||
+            '';
+          const body =
+            f['Opis'] ||
+            f['Sadržaj'] ||
+            f['Answer'] ||
+            f['Objašnjenje'] ||
+            '';
+
+          if (title || body) {
+            results.push({ title: String(title), body: String(body) });
+          }
+        }
+      } catch (e) {
+        console.warn('GLOBAL_TABLE_WARN', t.name, e.message);
+      }
+    }
+
+    // Nema posebne podjele – sve ide u “globalRules”
+    return { globalRules: results, glossary: [] };
+  } catch (e) {
+    console.warn('GLOBAL_META_WARN', e.message);
+    return { globalRules: [], glossary: [] };
+  }
 }
 
 function buildSystemPrompt(school, data, globalBlocks) {
@@ -65,18 +116,18 @@ function buildSystemPrompt(school, data, globalBlocks) {
   const pravila = school['AI_PRAVILA'] || 'Odgovaraj isključivo o ovoj autoškoli. Ne izmišljaj cijene ni termine.';
   const uvod = school['AI_POZDRAV'] || 'Bok! 👋 Kako ti mogu pomoći oko upisa, cijena ili termina?';
 
-  const kategorije = (data.kategorije || []).map(k => 
-    `• ${k['Kategorija']}: ${k['Opis'] || ''} | Teorija: ${k['Broj_sati_teorija'] || '-'}h | Praksa: ${k['Broj_sati_praksa'] || '-'}h | ` +
-    `Cijena paketa: ${k['Cijena_paketa'] ?? '-'} | Dodatni sat: ${k['Cijena_dodatni_sat'] ?? '-'}`
+  const kategorije = (data.kategorije || []).map(k =>
+    `• ${k['Kategorija'] || k['Kategorija_ref'] || ''}: ${k['Opis'] || ''} | Teorija: ${k['Broj_sati_teorija'] || '-'}h | ` +
+    `Praksa: ${k['Broj_sati_praksa'] || '-'}h | Cijena paketa: ${k['Cijena_paketa'] ?? '-'} | Dodatni sat: ${k['Cijena_dodatni_sat'] ?? '-'}`
   ).join('\n');
 
   const cjenik = (data.cjenik || []).map(c =>
-    `• ${c['Naziv_paketa']} (${c['Kategorija_ref'] || ''}) – ${c['Cijena'] ?? '-'} | ` +
+    `• ${c['Naziv_paketa'] || c['Naziv'] || ''} (${c['Kategorija_ref'] || ''}) – ${c['Cijena'] ?? '-'} | ` +
     `Uključeno: ${c['Što_uključeno'] || ''} | Uvjeti: ${c['Uvjeti'] || ''}`
   ).join('\n');
 
   const naknade = (data.naknade || []).map(n =>
-    `• ${n['Naziv_naknade']}: ${n['Iznos'] ?? '-'} (${n['Kome_se_plaća'] || ''}) – ${n['Opis'] || ''}`
+    `• ${n['Naziv_naknade'] || n['Naziv'] || ''}: ${n['Iznos'] ?? '-'} (${n['Kome_se_plaća'] || ''}) – ${n['Opis'] || ''}`
   ).join('\n');
 
   const uvjeti = (data.uvjeti || []).map(u =>
@@ -84,18 +135,15 @@ function buildSystemPrompt(school, data, globalBlocks) {
   ).join('\n');
 
   const dodatne = (data.dodatne || []).map(d =>
-    `• ${d['Naziv']}: ${d['Opis'] || ''} (${d['Cijena'] ?? '-'})`
+    `• ${d['Naziv'] || ''}: ${d['Opis'] || ''} (${d['Cijena'] ?? '-'})`
   ).join('\n');
 
   const nastava = data.nastava?.[0] || {};
   const teorija = nastava['Teorija_prometni_propisi_opis'] || '';
   const prvaPomoc = nastava['Prva_pomoć_opis'] || '';
 
-  const globalRules = (globalBlocks.globalRules || [])
-    .map(g => `• ${g['Naziv'] || 'Pravilo'}: ${g['Sadržaj'] || ''}`).join('\n');
-
-  const glossary = (globalBlocks.glossary || [])
-    .map(g => `• ${g['Pojam']}: ${g['Opis'] || ''}`).join('\n');
+  const globalJoined = (globalBlocks.globalRules || [])
+    .map(g => `• ${g.title}: ${g.body}`).join('\n');
 
   return `
 Ti si AI asistent autoškole.
@@ -125,10 +173,8 @@ ${dodatne || '(nema podataka)'}
 • Teorija: ${teorija}
 • Prva pomoć: ${prvaPomoc}
 
-=== Globalna pravila (rezime) ===
-${globalRules || '(—)'}
-=== Pojmovnik (rezime) ===
-${glossary || '(—)'}
+=== GLOBAL – opći vodiči i objašnjenja ===
+${globalJoined || '(—)'}
 
 Otvarajući pozdrav: ${uvod}
 
@@ -136,19 +182,26 @@ Upute:
 - Ako korisnik pita za upis, ponudi CTA iz "UPIŠI SE ONLINE" ako postoji.
 - Ako nema traženih podataka, reci da provjeri s uredom i daj kontakt.
 - Odgovaraj sažeto, jasno i lokalno relevantno.
-  `;
+`;
 }
 
-// ---------- API ----------
+/* ---------------- API ---------------- */
+
 app.post('/api/ask', async (req, res) => {
   try {
     const { message, history = [] } = req.body || {};
     if (!message) return res.status(400).json({ ok: false, error: 'Missing message' });
 
+    // “safe” škola – da radi i kad Individual još nije popunjen
     const school = await getSchoolRow();
-    if (!school || !school['Slug (autoškola)']) {
-      return res.status(404).json({ ok: false, error: 'School not found (provjeri Slug u AUTOŠKOLE)' });
-    }
+    const safeSchool = (school && Object.keys(school).length) ? school : {
+      'AI_PERSONA': 'Smiren, stručan instruktor.',
+      'AI_TON': 'prijateljski, jasan',
+      'AI_STIL': 'kratki odlomci; konkretno',
+      'AI_PRAVILA': 'Odgovaraj isključivo o autoškoli.',
+      'AI_POZDRAV': 'Bok! Kako ti mogu pomoći?',
+      'Telefon': '', 'Email': '', 'Web': '', 'Radno_vrijeme': ''
+    };
 
     const [kategorije, cjenik, naknade, uvjeti, dodatne, nastava, upisi, globalBlocks] = await Promise.all([
       getTableBySlug('KATEGORIJE AUTOŠKOLE'),
@@ -161,7 +214,7 @@ app.post('/api/ask', async (req, res) => {
       getGlobalBlocks()
     ]);
 
-    const systemPrompt = buildSystemPrompt(school, {
+    const systemPrompt = buildSystemPrompt(safeSchool, {
       kategorije, cjenik, naknade, uvjeti, dodatne, nastava, upisi
     }, globalBlocks);
 
@@ -191,6 +244,25 @@ app.post('/api/ask', async (req, res) => {
 });
 
 app.get('/api/health', (_, res) => res.json({ ok: true }));
+
+// brzi dijagnostički endpoint
+app.get('/api/debug', async (_, res) => {
+  try {
+    const school = await getSchoolRow();
+    const tabs = ['KATEGORIJE AUTOŠKOLE','CJENIK I PRAVILA','NAKNADE ZA POLAGANJE','UVJETI PLAĆANJA','DODATNE USLUGE','NASTAVA & PREDAVANJA','UPIŠI SE ONLINE'];
+    const out = {
+      schoolSlug: school?.['Slug (autoškola)'] || null,
+      tables: {},
+      global: {}
+    };
+    for (const t of tabs) out.tables[t] = (await getTableBySlug(t)).length;
+    const g = await getGlobalBlocks();
+    out.global.rules = g.globalRules.length;
+    res.json(out);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
 
 app.listen(PORT, () => {
   console.log(`✅ AI Testigo agent radi na portu :${PORT}`);
