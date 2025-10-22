@@ -181,19 +181,20 @@ function extractFacts(userText, data, school){
     if (list) return `VOZNI PARK${kat?` – Kategorija ${kat}`:''}:\n${list}`;
   }
 
-  return ''; // nema posebnih činjenica – neka model koristi širi sažetak
+  return ''; // nema posebnih činjenica – neka model koristi sažetke + global
 }
 
-/* ---------- System prompt (snažna ograda) ---------- */
+/* ---------- System prompt (primarno Individual, fallback Global) ---------- */
 function buildSystemPrompt(school, data, globalBlocks, facts) {
   const persona = school['AI_PERSONA'] || 'Smiren, stručan instruktor koji jasno i praktično objašnjava.';
   const ton     = school['AI_TON']     || 'prijateljski, jasan, bez žargona';
   const stil    = school['AI_STIL']    || 'kratki odlomci; konkretni odgovori; CTA gdje ima smisla';
-  const pravila = school['AI_PRAVILA'] || 'Odgovaraj isključivo o ovoj autoškoli. Ne izmišljaj cijene ni termine.';
+  const pravila = school['AI_PRAVILA'] || 'Primarno odgovaraj o ovoj autoškoli i ne izmišljaj podatke.';
+
   const uvod    = school['AI_POZDRAV'] || 'Bok! 👋 Kako ti mogu pomoći oko upisa, cijena ili termina?';
 
   const kategorije = (data.kategorije || []).map(k =>
-    `• ${k['Kategorija'] || k['Kategorija_ref'] || k['Naziv'] || ''}: Teorija ${k['Broj_sati_teorija'] ?? '-'}h | Praksa ${k['Broj_sati_praksa'] ?? '-'}h | Paket ${k['Cijena_paketa'] ?? '-'} | Dodatni sat ${k['Cijena_dodatni_sat'] ?? '-'}`
+    `• ${k['Kategorija'] || k['Kategorija_ref'] || k['Naziv'] || ''}: Teorija ${k['Broj_sati_teorija'] ?? '-'}h | Praksa ${k['Broj_sati_praksa'] ?? '-'}h | Paket ${k['Cijena_paketa'] ?? '-'} | Dodatni sat ${k['Cijena_dodatni_sat'] ?? '-'}``
   ).join('\n');
 
   const cjenik = (data.cjenik || []).map(c =>
@@ -205,7 +206,6 @@ function buildSystemPrompt(school, data, globalBlocks, facts) {
   ).join('\n');
 
   const uvjeti = uvjetiText(data.uvjeti);
-
   const dodatne = (data.dodatne || []).map(d => `• ${d['Naziv'] || ''}: ${d['Opis'] || ''} (${d['Cijena'] ?? '-'})`).join('\n');
 
   const vozniPark = listVehicles(data.vozni, '');
@@ -214,8 +214,12 @@ function buildSystemPrompt(school, data, globalBlocks, facts) {
   const globalJoined = (globalBlocks.globalRules || []).map(g => `• ${g.title}: ${g.body}`).join('\n');
 
   return `
-Ti si AI asistent autoškole. ODGOVARAJ ISKLJUČIVO na temelju podataka iz baze **AI TESTIGO – Individualni podatci** (sekcije niže).
-Ako informacija NIJE navedena, reci "trenutačno nemam taj podatak" i ponudi kontakt. NE DAJI općenite/spekulativne odgovore.
+Ti si AI asistent autoškole.
+
+**Politika odgovaranja (vrlo važno):**
+1) **Prvo** koristi podatke iz baze **AI TESTIGO – Individualni podatci** (sekcije niže i/ili ČINJENICE ZA ODGOVOR).
+2) **Ako u Individualnoj bazi nema odgovora**, smiješ i trebaš koristiti **GLOBALNE VODIČE** (sekcija "Globalni vodiči (opće)").
+3) Ako nema ni tamo, reci da trenutačno nemaš taj podatak i ponudi kontakt. Nikada ne izmišljaj.
 
 Osobnost: ${persona}
 Ton: ${ton}
@@ -247,13 +251,9 @@ ${vozniPark || '(nema podataka)'}
 === Poligon (sažetak) ===
 ${poligon || '(nema podataka)'}
 
-=== Globalni vodiči (opće) ===
+=== Globalni vodiči (opće) — koristi ih samo ako Individual nema podatak ===
 ${globalJoined || '(—)'}
 
-Upute:
-- Ako korisnik pita za vozila/modèle, koristi sekciju VOZNI PARK (ili ČINJENICE).
-- Za poligon/adresu/prvu pomoć koristi odgovarajuće ČINJENICE/Lokacije.
-- Ako nema zapisa, reci da podatak trenutačno nije dostupan i ponudi kontakt.
 Otvarajući pozdrav: ${uvod}
 `.trim();
 }
@@ -270,7 +270,7 @@ app.post('/api/ask', async (req, res) => {
       'AI_PERSONA': 'Smiren, stručan instruktor.',
       'AI_TON': 'prijateljski, jasan',
       'AI_STIL': 'kratki odlomci; konkretno',
-      'AI_PRAVILA': 'Odgovaraj isključivo o autoškoli.',
+      'AI_PRAVILA': 'Odgovaraj prvenstveno o autoškoli.',
       'AI_POZDRAV': 'Bok! Kako ti mogu pomoći?',
       'Telefon': '', 'Email': '', 'Web': '', 'Radno_vrijeme': ''
     };
@@ -293,7 +293,7 @@ app.post('/api/ask', async (req, res) => {
 
     const data = { kategorije, cjenik, naknade, uvjeti, dodatne, nastava, upisi, vozni, lokacije };
 
-    // pripremi ciljane činjenice za ovo konkretno pitanje
+    // ciljane činjenice za ovo konkretno pitanje
     const facts = extractFacts(message, data, safeSchool);
 
     const systemPrompt = buildSystemPrompt(safeSchool, data, globalBlocks, facts);
