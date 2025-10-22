@@ -194,7 +194,7 @@ function buildSystemPrompt(school, data, globalBlocks, facts) {
   const uvod    = school['AI_POZDRAV'] || 'Bok! 👋 Kako ti mogu pomoći oko upisa, cijena ili termina?';
 
   const kategorije = (data.kategorije || []).map(k =>
-    `• ${k['Kategorija'] || k['Kategorija_ref'] || k['Naziv'] || ''}: Teorija ${k['Broj_sati_teorija'] ?? '-'}h | Praksa ${k['Broj_sati_praksa'] ?? '-'}h | Paket ${k['Cijena_paketa'] ?? '-'} | Dodatni sat ${k['Cijena_dodatni_sat'] ?? '-'}``
+    `• ${k['Kategorija'] || k['Kategorija_ref'] || k['Naziv'] || ''}: Teorija ${k['Broj_sati_teorija'] ?? '-'}h | Praksa ${k['Broj_sati_praksa'] ?? '-'}h | Paket ${k['Cijena_paketa'] ?? '-'} | Dodatni sat ${k['Cijena_dodatni_sat'] ?? '-'}`
   ).join('\n');
 
   const cjenik = (data.cjenik || []).map(c =>
