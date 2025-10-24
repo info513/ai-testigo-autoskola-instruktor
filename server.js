@@ -1,3 +1,4 @@
+// server.js
 import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
@@ -10,7 +11,6 @@ const {
   OPENAI_MODEL = 'gpt-4o-mini',
   AIRTABLE_API_KEY,
   AIRTABLE_BASE_ID_INDIVIDUAL,
-  AIRTABLE_BASE_ID_GLOBAL,
   SCHOOL_SLUG: DEFAULT_SLUG = 'instruktor'
 } = process.env;
 
@@ -27,23 +27,27 @@ app.use(express.json());
 
 const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
 const atInd = new Airtable({ apiKey: AIRTABLE_API_KEY }).base(AIRTABLE_BASE_ID_INDIVIDUAL);
-const atGlobal = AIRTABLE_BASE_ID_GLOBAL
-  ? new Airtable({ apiKey: AIRTABLE_API_KEY }).base(AIRTABLE_BASE_ID_GLOBAL)
-  : null;
 
+/* ===== Helpers ===== */
 const norm = v => (Array.isArray(v) ? v[0] : v ?? '').toString();
 const normSlug = v => norm(v).trim().toLowerCase();
 const sanitizeForFormula = s => norm(s).replace(/"/g, '').replace(/'/g, '’');
 
 function convertToEuro(value) {
-  const num = parseFloat(value);
-  if (value.includes('kn')) return Math.round(num / 7.5345) + ' €';
-  return value.includes('€') ? value : `${num} €`;
+  const v = norm(value).trim();
+  if (!v) return '';
+  if (v.includes('€')) return v;
+  if (v.toLowerCase().includes('kn')) {
+    const num = parseFloat(v);
+    return isNaN(num) ? v : Math.round(num / 7.5345) + ' €';
+  }
+  const num = parseFloat(v);
+  return isNaN(num) ? v : `${num} €`;
 }
 
-function calcMonthlyRate(price, months = 12) {
-  const num = parseFloat(price);
-  return isNaN(num) ? '-' : Math.round(num / months) + ' €/mj';
+function calcMonthlyRate(raw, months = 12) {
+  const num = parseFloat(norm(raw));
+  return isNaN(num) ? '—' : Math.round(num / months) + ' €/mj';
 }
 
 function listVehicles(rows, wantedKat) {
@@ -61,7 +65,9 @@ function listVehicles(rows, wantedKat) {
       const mjenjac = norm(r['Mjenjač'] || r['Mjenjac']);
       return `• ${kat ? `[${kat}] ` : ''}${model || tip}${god ? ' (' + god + ')' : ''}${mjenjac ? ' – ' + mjenjac : ''}`;
     });
-  return items.slice(0, 20).join('\n');
+  const list = items.slice(0, 20);
+  const extra = items.length > 20 ? `\n…i još ${items.length - 20} vozila.` : '';
+  return list.join('\n') + extra;
 }
 
 function findLocation(rows, needle) {
@@ -88,6 +94,7 @@ function uvjetiText(rows) {
   ].filter(Boolean).join(' | ');
 }
 
+/* ===== Tablice (INDIVIDUAL) ===== */
 const TABLES = {
   kategorije: ['KATEGORIJE', 'KATEGORIJE AUTOŠKOLE'],
   cjenik: ['CJENIK', 'CJENIK I PRAVILA'],
@@ -101,6 +108,7 @@ const TABLES = {
   upisi: ['UPIŠI SE ONLINE']
 };
 
+/* ===== Data access (INDIVIDUAL only) ===== */
 async function getSchoolRow(slug) {
   const safe = sanitizeForFormula(slug || DEFAULT_SLUG);
   try {
@@ -134,6 +142,8 @@ async function getBySlugMulti(nameVariants, slug) {
   }
   return [];
 }
+
+/* ===== Heuristike za brze činjenice ===== */
 function extractFacts(userText, data, school) {
   const t = norm(userText).toLowerCase();
 
@@ -178,65 +188,76 @@ function extractFacts(userText, data, school) {
   }
 
   if (t.includes('koliko sati') || t.includes('satnica') || t.includes('teorija') || t.includes('praksa')) {
-    const kat = ['am', 'a1', 'a2', 'a', 'b', 'c', 'ce', 'd'].find(k => t.includes(k));
-    const row = data.kategorije.find(k => norm(k['Kategorija'])?.toLowerCase() === kat);
-    if (row) {
-      return `SATNICA ZA ${kat.toUpperCase()}:\n• Teorija: ${row['Broj_sati_teorija']}h\n• Praksa: ${row['Broj_sati_praksa']}h`;
+    const kat = ['am','a1','a2','a','b','c','ce','d'].find(k =>
+      t.includes(` ${k} `) || t.endsWith(` ${k}`) || t.startsWith(`${k} `) || t.includes(`${k} kategor`)
+    );
+    if (kat && Array.isArray(data.kategorije)) {
+      const row = data.kategorije.find(k => norm(k['Kategorija']).toLowerCase() === kat);
+      if (row) {
+        return `SATNICA ZA ${kat.toUpperCase()}:\n• Teorija: ${row['Broj_sati_teorija']}h\n• Praksa: ${row['Broj_sati_praksa']}h`;
+      }
     }
   }
 
   return '';
 }
 
-function buildSystemPrompt(school, data, globalBlocks, facts) {
+/* ===== Prompt ===== */
+function buildSystemPrompt(school, data, facts) {
   const persona = norm(school['AI_PERSONA'] || 'Smiren, stručan instruktor.');
   const ton = norm(school['AI_TON'] || 'prijateljski, jasan');
   const stil = norm(school['AI_STIL'] || 'kratki odlomci; konkretno');
-  const pravila = norm(school['AI_PRAVILA'] || 'Odgovaraj prvenstveno o autoškoli. Ne nagađaj. Koristi samo dostupne podatke.');
+  const pravila = norm(school['AI_PRAVILA'] || 'Odgovaraj isključivo prema INDIVIDUAL podacima. Ne nagađaj.');
   const uvod = norm(school['AI_POZDRAV'] || 'Bok! 👋 Kako ti mogu pomoći oko upisa, cijena ili termina?');
 
   const kategorije = (data.kategorije || []).map(k => {
     const naziv = norm(k['Kategorija'] || k['Naziv']);
-    const teorija = k['Broj_sati_teorija'];
-    const praksa = k['Broj_sati_praksa'];
+    const teorija = norm(k['Broj_sati_teorija']);
+    const praksa = norm(k['Broj_sati_praksa']);
     return `• ${naziv}: Teorija ${teorija}h | Praksa ${praksa}h`;
-  }).join('\n');
+  }).filter(Boolean).join('\n');
 
   const cjenik = (data.cjenik || []).map(c => {
     const naziv = norm(c['Varijanta'] || c['Naziv']);
     const kat = norm(c['Kategorija']);
-    const cijena = convertToEuro(norm(c['Cijena']));
-    const mjRata = calcMonthlyRate(norm(c['Cijena']));
-    return `• ${naziv} (${kat}) – ${cijena} (${mjRata})`;
-  }).join('\n');
+    const cijenaRaw = norm(c['Cijena']);
+    const cijena = convertToEuro(cijenaRaw);
+    const mjRata = calcMonthlyRate(cijenaRaw);
+    return `• ${naziv} (${kat}) – ${cijena || '—'} (${mjRata})`;
+  }).filter(Boolean).join('\n');
 
-  const hak = (data.hak || []).map(n =>
-    `• ${norm(n['Naziv'])}: ${convertToEuro(norm(n['Iznos']))} (${norm(n['Kome_se_plaća'])})`
-  ).join('\n');
+  const hak = (data.hak || []).map(n => {
+    const name = norm(n['Naziv']);
+    const iznos = convertToEuro(norm(n['Iznos']));
+    const kome = norm(n['Kome_se_plaća']);
+    return (name || iznos || kome) ? `• ${name}: ${iznos}${kome ? ` (${kome})` : ''}` : '';
+  }).filter(Boolean).join('\n');
 
   const uvjeti = uvjetiText(data.uvjeti);
-  const dodatne = (data.dodatne || []).map(d =>
-    `• ${norm(d['Naziv'])}: ${norm(d['Opis'])} (${convertToEuro(norm(d['Cijena']))})`
-  ).join('\n');
+
+  const dodatne = (data.dodatne || []).map(d => {
+    const name = norm(d['Naziv']);
+    const opis = norm(d['Opis']);
+    const cijena = convertToEuro(norm(d['Cijena']));
+    return (name || opis || cijena) ? `• ${name}: ${opis}${cijena ? ` (${cijena})` : ''}` : '';
+  }).filter(Boolean).join('\n');
 
   const instruktori = (data.instruktori || []).map(i => {
     const ime = norm(i['Ime i prezime']);
     const kat = norm(i['Kategorije']);
     const tel = norm(i['Telefon']);
-    return `• ${ime}${kat ? ' – ' + kat : ''}${tel ? ' | ' + tel : ''}`;
-  }).join('\n');
+    return (ime || kat || tel) ? `• ${ime}${kat ? ' – ' + kat : ''}${tel ? ' | ' + tel : ''}` : '';
+  }).filter(Boolean).join('\n');
 
   const vozniPark = listVehicles(data.vozni, '');
   const poligon = findLocation(data.lokacije, 'poligon');
-  const globalJoined = (globalBlocks.globalRules || []).map(g => `• ${g.title}: ${g.body}`).join('\n');
 
   return `
 Ti si AI asistent autoškole.
 
-**Politika odgovaranja:**
-1) Koristi INDIVIDUAL podatke (tablice + činjenice).
-2) Ako nema, koristi GLOBAL vodiče.
-3) Ako nema ni tamo, reci iskreno da nemaš podatak i predloži kontakt.
+**Politika odgovaranja (SAMO INDIVIDUAL BAZA):**
+1) Koristi isključivo INDIVIDUAL podatke (tablice + činjenice).
+2) Ako podatak ne postoji, reci da nemaš informaciju i ponudi kontakt.
 
 Osobnost: ${persona}
 Ton: ${ton}
@@ -271,12 +292,10 @@ ${vozniPark || '(nema podataka)'}
 === Poligon ===
 ${poligon || '(nema podataka)'}
 
-=== Globalni vodiči ===
-${globalJoined || '(—)'}
-
 Otvarajući pozdrav: ${uvod}
 `.trim();
 }
+
 /* ===== API ===== */
 app.all('/api/ask', async (req, res) => {
   try {
@@ -300,12 +319,8 @@ app.all('/api/ask', async (req, res) => {
       data[key] = await getBySlugMulti(variants, slug);
     }
 
-    const globalBlocks = atGlobal
-      ? { globalRules: await getBySlugMulti(['GLOBAL RULES', 'GLOBALNE INFORMACIJE'], slug) }
-      : { globalRules: [] };
-
     const facts = extractFacts(userMessage, data, safeSchool);
-    const systemPrompt = buildSystemPrompt(safeSchool, data, globalBlocks, facts);
+    const systemPrompt = buildSystemPrompt(safeSchool, data, facts);
 
     const messages = [
       { role: 'system', content: systemPrompt },
@@ -354,5 +369,5 @@ app.get('/api/health', (req, res) => {
 
 /* ===== Start ===== */
 app.listen(PORT, () => {
-  console.log(`✅ AI Testigo agent radi na portu :${PORT}`);
+  console.log(`✅ AI Testigo agent (INDIVIDUAL only) radi na portu :${PORT}`);
 });
