@@ -1,4 +1,3 @@
-// server.js
 import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
@@ -37,6 +36,17 @@ const norm = v => (Array.isArray(v) ? v[0] : v ?? '').toString();
 const normSlug = v => norm(v).trim().toLowerCase();
 const sanitizeForFormula = s => norm(s).replace(/"/g, '').replace(/'/g, '’');
 
+function convertToEuro(value) {
+  const num = parseFloat(value);
+  if (value.includes('kn')) return Math.round(num / 7.5345) + ' €';
+  return value.includes('€') ? value : `${num} €`;
+}
+
+function calcMonthlyRate(price, months = 12) {
+  const num = parseFloat(price);
+  return isNaN(num) ? '-' : Math.round(num / months) + ' €/mj';
+}
+
 function listVehicles(rows, wantedKat) {
   if (!rows?.length) return '';
   const items = rows
@@ -62,7 +72,7 @@ function findLocation(rows, needle) {
   const naziv = norm(row['Naziv ustanove / partnera'] || row['Naziv'] || 'Lokacija');
   const adresa = norm(row['Adresa'] || row['Lokacija']);
   const grad = norm(row['Grad']);
-  const url = norm(row['Geo_URL'] || row['URL'] || row['Maps']);
+  const url = norm(row['Geo_URL'] || row['URL'] || row['Maps'] || row['Google Maps']);
   return `${naziv}${adresa ? ', ' + adresa : ''}${grad ? ', ' + grad : ''}${url ? ' | Mapa: ' + url : ''}`;
 }
 
@@ -88,7 +98,7 @@ async function getSchoolRow(slug) {
       try {
         const recs = await atInd('AUTOŠKOLE').select({ filterByFormula: `${f} = "${safe}"`, maxRecords: 1 }).all();
         if (recs?.[0]) return recs[0].fields || {};
-      } catch { /* try next variant */ }
+      } catch {}
     }
     const any = await atInd('AUTOŠKOLE').select({ maxRecords: 1 }).all();
     return any?.[0]?.fields || {};
@@ -98,7 +108,7 @@ async function getSchoolRow(slug) {
   }
 }
 
-/* ===== Dohvat tablica s novim/starim nazivima ===== */
+/* ===== Tablice ===== */
 const TABLES = {
   kategorije: ['KATEGORIJE', 'KATEGORIJE AUTOŠKOLE'],
   cjenik: ['CJENIK', 'CJENIK I PRAVILA'],
@@ -108,8 +118,8 @@ const TABLES = {
   instruktori: ['INSTRUKTORI'],
   vozni: ['VOZNI PARK'],
   lokacije: ['LOKACIJE', 'LOKACIJE & PARTNERI'],
-  nastava: ['NASTAVA & PREDAVANJA'],          // opcionalno (možda nema)
-  upisi: ['UPIŠI SE ONLINE']                  // opcionalno (možda nema)
+  nastava: ['NASTAVA & PREDAVANJA'],
+  upisi: ['UPIŠI SE ONLINE']
 };
 
 async function getBySlugMulti(nameVariants, slug) {
@@ -123,49 +133,18 @@ async function getBySlugMulti(nameVariants, slug) {
         normSlug(f?.Slug || f?.['Slug (autoškola)'] || f?.['Slug (Autoškola)'] || f?.['slug (autoškola)']) === normSlug(safeSlug)
       );
       return rows.length ? rows : all.map(r => r.fields);
-    } catch { /* try next variant */ }
+    } catch {}
   }
   return [];
 }
-
-/* ===== GLOBAL blokovi (opći sadržaji) ===== */
-async function getGlobalBlocks() {
-  if (!atGlobal || !AIRTABLE_BASE_ID_GLOBAL) return { globalRules: [] };
-  try {
-    const metaResp = await fetch(
-      `https://api.airtable.com/v0/meta/bases/${AIRTABLE_BASE_ID_GLOBAL}/tables`,
-      { headers: { Authorization: `Bearer ${AIRTABLE_API_KEY}` } }
-    );
-    const meta = await metaResp.json();
-    if (!meta?.tables?.length) return { globalRules: [] };
-
-    const results = [];
-    for (const t of meta.tables) {
-      try {
-        const recs = await atGlobal(t.name).select({ maxRecords: 500 }).all();
-        for (const r of recs) {
-          const f = r.fields || {};
-          const title = f['Naziv rubrike / pitanje'] || f['Naziv'] || f['Pitanje'] || f['Pojam'] || '';
-          const body = f['Opis'] || f['Sadržaj'] || f['Answer'] || f['Objašnjenje'] || '';
-          if (title || body) results.push({ title: norm(title), body: norm(body) });
-        }
-      } catch { /* ignore table */ }
-    }
-    return { globalRules: results };
-  } catch (e) {
-    console.warn('GLOBAL_META_WARN', e.message);
-    return { globalRules: [] };
-  }
-}
-
-/* ===== Heuristike za “činjenice” ===== */
 function extractFacts(userText, data, school) {
   const t = norm(userText).toLowerCase();
 
+  // Lokacija autoškole
   if (t.includes('adresa') || t.includes('gdje ste') || t.includes('gdje se nalazite') || t.includes('lokacija')) {
     const adr = norm(school['Adresa']);
-    const maps = norm(school['Google Maps'] || school['Maps'] || school['School.Maps_URL']);
-    const hours = norm(school['Radno_vrijeme'] || school['School.Hours']);
+    const maps = norm(school['Google Maps'] || school['Maps'] || school['Geo_URL']);
+    const hours = norm(school['Radno_vrijeme']);
     if (adr || maps || hours) {
       return [
         'ADRESA AUTOŠKOLE:',
@@ -178,22 +157,26 @@ function extractFacts(userText, data, school) {
     if (alt) return `ADRESA AUTOŠKOLE:\n• ${alt}`;
   }
 
-  if (t.includes('poligon') || t.includes('vježbalište') || t.includes('vjezbalište')) {
+  // Poligon
+  if (t.includes('poligon') || t.includes('vježbalište')) {
     const pol = findLocation(data.lokacije, 'poligon');
     if (pol) return `POLIGON:\n• ${pol}`;
   }
 
-  if (t.includes('prva pomoć') || t.includes('prve pomoći') || t.includes('prve pomoci')) {
+  // Prva pomoć
+  if (t.includes('prva pomoć')) {
     const pp = findLocation(data.lokacije, 'prva pomoć');
     if (pp) return `PRVA POMOĆ:\n• ${pp}`;
   }
 
-  if (t.includes('kartic') || t.includes('rate') || t.includes('plaćan') || t.includes('placan')) {
+  // Plaćanje
+  if (t.includes('kartic') || t.includes('rate') || t.includes('plaćan')) {
     const u = uvjetiText(data.uvjeti);
     if (u) return `UVJETI PLAĆANJA:\n${u}`;
   }
 
-  if (t.includes('vozni park') || t.includes('vozila') || t.includes('voz')) {
+  // Vozni park
+  if (t.includes('vozni park') || t.includes('vozila')) {
     let kat = '';
     for (const k of ['am', 'a1', 'a2', 'a', 'b', 'c', 'ce', 'd']) {
       if (t.includes(` ${k} `) || t.endsWith(` ${k}`) || t.startsWith(`${k} `)) { kat = k.toUpperCase(); break; }
@@ -202,50 +185,68 @@ function extractFacts(userText, data, school) {
     if (list) return `VOZNI PARK${kat ? ` – Kategorija ${kat}` : ''}:\n${list}`;
   }
 
+  // Satnica
+  if (t.includes('koliko sati') || t.includes('satnica') || t.includes('teorija') || t.includes('praksa')) {
+    const kat = ['am', 'a1', 'a2', 'a', 'b', 'c', 'ce', 'd'].find(k => t.includes(k));
+    const row = data.kategorije.find(k => norm(k['Kategorija'])?.toLowerCase() === kat);
+    if (row) {
+      return `SATNICA ZA ${kat.toUpperCase()}:\n• Teorija: ${row['Broj_sati_teorija']}h\n• Praksa: ${row['Broj_sati_praksa']}h`;
+    }
+  }
+
   return '';
 }
 
-/* ===== System prompt ===== */
 function buildSystemPrompt(school, data, globalBlocks, facts) {
-  const persona = norm(school['AI_PERSONA'] || 'Smiren, stručan instruktor koji jasno i praktično objašnjava.');
-  const ton = norm(school['AI_TON'] || 'prijateljski, jasan, bez žargona');
-  const stil = norm(school['AI_STIL'] || 'kratki odlomci; konkretno; CTA gdje ima smisla');
-  const pravila = norm(school['AI_PRAVILA'] || 'Primarno odgovaraj o ovoj autoškoli i ne izmišljaj podatke.');
+  const persona = norm(school['AI_PERSONA'] || 'Smiren, stručan instruktor.');
+  const ton = norm(school['AI_TON'] || 'prijateljski, jasan');
+  const stil = norm(school['AI_STIL'] || 'kratki odlomci; konkretno');
+  const pravila = norm(school['AI_PRAVILA'] || 'Odgovaraj prvenstveno o autoškoli. Ne nagađaj. Koristi samo dostupne podatke.');
   const uvod = norm(school['AI_POZDRAV'] || 'Bok! 👋 Kako ti mogu pomoći oko upisa, cijena ili termina?');
 
-  const kategorije = (data.kategorije || []).map(k =>
-    `• ${norm(k['Kategorija'] || k['Naziv'] || k['Kategorija_ref'])}: Teorija ${k['Broj_sati_teorija'] ?? '-'}h | Praksa ${k['Broj_sati_praksa'] ?? '-'}h`
-  ).join('\n');
+  const kategorije = (data.kategorije || []).map(k => {
+    const naziv = norm(k['Kategorija'] || k['Naziv']);
+    const teorija = k['Broj_sati_teorija'];
+    const praksa = k['Broj_sati_praksa'];
+    return `• ${naziv}: Teorija ${teorija}h | Praksa ${praksa}h`;
+  }).join('\n');
 
-  const cjenik = (data.cjenik || []).map(c =>
-    `• ${norm(c['Varijanta'] || c['Naziv_paketa'] || c['Naziv'])} (${norm(c['Kategorija'] || c['Kategorija_ref'])}) – ${norm(c['Cijena']) || '-'}${norm(c['Napomena']) ? ' | ' + norm(c['Napomena']) : ''}`
-  ).join('\n');
+  const cjenik = (data.cjenik || []).map(c => {
+    const naziv = norm(c['Varijanta'] || c['Naziv']);
+    const kat = norm(c['Kategorija']);
+    const cijena = convertToEuro(norm(c['Cijena']));
+    const mjRata = calcMonthlyRate(norm(c['Cijena']));
+    return `• ${naziv} (${kat}) – ${cijena} (${mjRata})`;
+  }).join('\n');
 
   const hak = (data.hak || []).map(n =>
-    `• ${norm(n['Naziv_naknade'] || n['Naziv'])}: ${norm(n['Iznos']) || '-'} (${norm(n['Kome_se_plaća'] || n['Kome se plaća'] || n['Tko'])})${norm(n['Opis']) ? ' – ' + norm(n['Opis']) : ''}`
+    `• ${norm(n['Naziv'])}: ${convertToEuro(norm(n['Iznos']))} (${norm(n['Kome_se_plaća'])})`
   ).join('\n');
 
   const uvjeti = uvjetiText(data.uvjeti);
-  const dodatne = (data.dodatne || []).map(d => `• ${norm(d['Naziv'])}: ${norm(d['Opis'])} (${norm(d['Cijena']) || '-'})`).join('\n');
-  const vozniPark = listVehicles(data.vozni, '');
-  const poligon = findLocation(data.lokacije, 'poligon');
+  const dodatne = (data.dodatne || []).map(d =>
+    `• ${norm(d['Naziv'])}: ${norm(d['Opis'])} (${convertToEuro(norm(d['Cijena']))})`
+  ).join('\n');
 
   const instruktori = (data.instruktori || []).map(i => {
-    const ime = norm(i['Ime i prezime'] || i['Ime'] || i['Instruktor']);
-    const kat = norm(i['Kategorije'] || i['Kategorija']);
-    const tel = norm(i['Telefon'] || i['Mobitel']);
+    const ime = norm(i['Ime i prezime']);
+    const kat = norm(i['Kategorije']);
+    const tel = norm(i['Telefon']);
     return `• ${ime}${kat ? ' – ' + kat : ''}${tel ? ' | ' + tel : ''}`;
   }).join('\n');
+
+  const vozniPark = listVehicles(data.vozni, '');
+  const poligon = findLocation(data.lokacije, 'poligon');
 
   const globalJoined = (globalBlocks.globalRules || []).map(g => `• ${g.title}: ${g.body}`).join('\n');
 
   return `
 Ti si AI asistent autoškole.
 
-**Politika odgovaranja (važno):**
-1) Prvo koristi INDIVIDUAL podatke (sekcije niže + ČINJENICE ZA ODGOVOR).
-2) Ako nema u INDIVIDUAL, smiješ koristiti GLOBAL vodiče.
-3) Ako nema ni tamo, reci da trenutno nemaš taj podatak i ponudi kontakt. Ne izmišljaj.
+**Politika odgovaranja:**
+1) Koristi INDIVIDUAL podatke (tablice + činjenice).
+2) Ako nema, koristi GLOBAL vodiče.
+3) Ako nema ni tamo, reci iskreno da nemaš podatak i predloži kontakt.
 
 Osobnost: ${persona}
 Ton: ${ton}
@@ -254,15 +255,15 @@ Pravila: ${pravila}
 
 Kontakt: ${norm(school['Telefon'])} | ${norm(school['Email'])} | ${norm(school['Web'])} | Radno vrijeme: ${norm(school['Radno_vrijeme'])}
 
-${facts ? `\n=== ČINJENICE ZA ODGOVOR (obavezno koristi) ===\n${facts}\n` : ''}
+${facts ? `\n=== ČINJENICE ZA ODGOVOR ===\n${facts}\n` : ''}
 
-=== Kategorije (sati) ===
+=== Kategorije ===
 ${kategorije || '(nema podataka)'}
 
 === CJENIK ===
 ${cjenik || '(nema podataka)'}
 
-=== PLAĆANJE HAK-u (ispitne naknade) ===
+=== HAK naknade ===
 ${hak || '(nema podataka)'}
 
 === Uvjeti plaćanja ===
@@ -274,58 +275,19 @@ ${dodatne || '(nema podataka)'}
 === Instruktori ===
 ${instruktori || '(nema podataka)'}
 
-=== Vozni park (sažetak) ===
+=== Vozni park ===
 ${vozniPark || '(nema podataka)'}
 
-=== Poligon (sažetak) ===
+=== Poligon ===
 ${poligon || '(nema podataka)'}
 
-=== Globalni vodiči (koristi samo ako Individual nema podatak) ===
+=== Globalni vodiči ===
 ${globalJoined || '(—)'}
 
 Otvarajući pozdrav: ${uvod}
 `.trim();
 }
-
 /* ===== API ===== */
-
-// Health
-app.get('/api/health', (_, res) => res.json({ ok: true }));
-
-// Debug (ne ruši se ako tablica ne postoji)
-app.get('/api/debug', async (req, res) => {
-  try {
-    const slug = normSlug(req.query.slug || req.headers['x-school-slug'] || DEFAULT_SLUG);
-    const school = await getSchoolRow(slug);
-    const report = { slug, schoolName: school?.['Naziv'] || null, tables: {}, samples: {} };
-
-    for (const [key, variants] of Object.entries(TABLES)) {
-      let total = 0, matched = 0, slugsFound = [];
-      let sample = [];
-      for (const t of variants) {
-        try {
-          const all = await atInd(t).select({ maxRecords: 200 }).all();
-          total = all.length;
-          slugsFound = Array.from(new Set(all.map(r =>
-            normSlug(r.fields?.Slug || r.fields?.['Slug (autoškola)'] || r.fields?.['Slug (Autoškola)'] || r.fields?.['slug (autoškola)'])
-          ).filter(Boolean)));
-          const filtered = await getBySlugMulti([t], slug);
-          matched = filtered.length;
-          sample = filtered.slice(0, 2).map(r => Object.fromEntries(Object.entries(r).slice(0, 10)));
-          break; // uspjelo za ovaj naziv
-        } catch { /* probaj idući naziv */ }
-      }
-      report.tables[key] = { foundNames: variants, total, matched, slugsFound };
-      report.samples[key] = sample;
-    }
-
-    res.json(report);
-  } catch (e) {
-    res.status(500).json({ ok: false, error: e.message });
-  }
-});
-
-// Glavni endpoint
 app.all('/api/ask', async (req, res) => {
   try {
     const userMessage = (req.method === 'GET' ? req.query.q : req.body?.q || req.body?.message) || '';
@@ -333,7 +295,6 @@ app.all('/api/ask', async (req, res) => {
     if (!userMessage) return res.status(400).json({ ok: false, error: 'Missing message (q)' });
 
     const slug = normSlug(req.query.slug || req.headers['x-school-slug'] || DEFAULT_SLUG);
-
     const school = await getSchoolRow(slug);
     const safeSchool = (school && Object.keys(school).length) ? school : {
       'AI_PERSONA': 'Smiren, stručan instruktor.',
@@ -344,87 +305,56 @@ app.all('/api/ask', async (req, res) => {
       'Telefon': '', 'Email': '', 'Web': '', 'Radno_vrijeme': ''
     };
 
-    const [
-      kategorije, cjenik, hak, uvjeti, dodatne, instruktori, vozni, lokacije, nastava, upisi
-    ] = await Promise.all([
-      getBySlugMulti(TABLES.kategorije, slug),
-      getBySlugMulti(TABLES.cjenik, slug),
-      getBySlugMulti(TABLES.hak, slug),
-      getBySlugMulti(TABLES.uvjeti, slug),
-      getBySlugMulti(TABLES.dodatne, slug),
-      getBySlugMulti(TABLES.instruktori, slug),
-      getBySlugMulti(TABLES.vozni, slug),
-      getBySlugMulti(TABLES.lokacije, slug),
-      getBySlugMulti(TABLES.nastava, slug),
-      getBySlugMulti(TABLES.upisi, slug)
-    ]);
+    const data = {};
+    for (const [key, variants] of Object.entries(TABLES)) {
+      data[key] = await getBySlugMulti(variants, slug);
+    }
 
-    const data = { kategorije, cjenik, hak, uvjeti, dodatne, instruktori, vozni, lokacije, nastava, upisi };
+    const globalBlocks = atGlobal
+      ? { globalRules: await getBySlugMulti(['GLOBAL RULES', 'GLOBALNE INFORMACIJE'], slug) }
+      : { globalRules: [] };
 
-    const globalBlocks = await getGlobalBlocks();
     const facts = extractFacts(userMessage, data, safeSchool);
     const systemPrompt = buildSystemPrompt(safeSchool, data, globalBlocks, facts);
 
-    // GLOBAL FAQ (ako postoji)
-    let faqText = '';
-    try {
-      if (atGlobal) {
-        const faq = await atGlobal('FAQ – Pitanja kandidata')
-          .select({
-            view: 'AI_ACTIVE',
-            filterByFormula: `FIND(LOWER("${sanitizeForFormula(userMessage)}"), {AI_INDEX})`,
-            maxRecords: 3
-          })
-          .firstPage();
-        faqText = (faq || []).map(r => `Q: ${norm(r.fields.Pitanje)}\nA: ${norm(r.fields.Odgovor)}`).join('\n\n');
-      }
-    } catch (e) {
-      console.warn('FAQ_SEARCH_WARN', e.message);
-    }
-
     const messages = [
       { role: 'system', content: systemPrompt },
-      ...history,
-      {
-        role: 'user',
-        content:
-`Korisnički upit: "${userMessage}"
-
-Relevantni GLOBAL FAQ zapisi:
-${faqText || '—'}
-
-Upute:
-- Ako korisnik traži lokaciju: daj adresu + Maps + radno vrijeme iz INDIVIDUAL.
-- Ako traži kontakt: daj tel, mob, email + link na kontakt formu (ako postoji).
-- Ako pita cijenu: prikaži prvo mjesečni iznos ≈ cijena/12 (zaokruži), zatim puni iznos.
-- Uz cijenu dodaj satnicu (teorija/praksa) ako postoji.
-- Ponudi online upis (ako postoji URL forme) i pitaj treba li još nešto.`
-      }
+      ...history.map(h => ({ role: h.role, content: h.content })),
+      { role: 'user', content: userMessage }
     ];
 
-    const completion = await openai.chat.completions.create({
+    const chat = await openai.chat.completions.create({
       model: OPENAI_MODEL,
       messages,
-      temperature: 0.2
+      temperature: 0.4
     });
 
-    const answer = completion.choices?.[0]?.message?.content?.trim() || 'Trenutno nemam odgovor.';
-    let cta = null;
-    if (upisi?.[0]?.['URL_forme'] || upisi?.[0]?.['URL'] || upisi?.[0]?.['Link']) {
-      cta = {
-        text: upisi?.[0]?.['CTA_tekst'] || upisi?.[0]?.['CTA'] || 'Upiši se online',
-        url: upisi?.[0]?.['URL_forme'] || upisi?.[0]?.['URL'] || upisi?.[0]?.['Link']
-      };
-    }
+    const reply = chat.choices?.[0]?.message?.content?.trim();
+    if (!reply) return res.status(500).json({ ok: false, error: 'Empty response from OpenAI' });
 
-    res.json({ ok: true, slug, answer, cta });
-  } catch (err) {
-    console.error('ASK_ERROR', err);
-    res.status(500).json({ ok: false, error: 'Server error' });
+    res.json({ ok: true, reply });
+  } catch (e) {
+    console.error('API_ERROR', e.message);
+    res.status(500).json({ ok: false, error: e.message });
   }
 });
 
-/* ===== START ===== */
+/* ===== Debug & Health ===== */
+app.get('/api/debug', async (req, res) => {
+  const slug = normSlug(req.query.slug || DEFAULT_SLUG);
+  const school = await getSchoolRow(slug);
+  const data = {};
+  for (const [key, variants] of Object.entries(TABLES)) {
+    data[key] = await getBySlugMulti(variants, slug);
+  }
+  res.json({ ok: true, slug, school, data });
+});
+
+app.get('/api/health', (req, res) => {
+  res.json({ ok: true, status: 'AI agent radi ✅', time: new Date().toISOString() });
+});
+
+/* ===== Start ===== */
 app.listen(PORT, () => {
   console.log(`✅ AI Testigo agent radi na portu :${PORT}`);
 });
