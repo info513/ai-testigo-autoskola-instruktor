@@ -4,7 +4,6 @@ import cors from 'cors';
 import Airtable from 'airtable';
 import OpenAI from 'openai';
 
-/* ===== ENV ===== */
 const {
   PORT = 8080,
   OPENAI_API_KEY,
@@ -15,12 +14,13 @@ const {
   SCHOOL_SLUG: DEFAULT_SLUG = 'instruktor'
 } = process.env;
 
+const promptVersion = 'v1.3.24';
+
 if (!OPENAI_API_KEY || !AIRTABLE_API_KEY || !AIRTABLE_BASE_ID_INDIVIDUAL) {
   console.error('❗ Nedostaju env varijable: OPENAI_API_KEY, AIRTABLE_API_KEY ili AIRTABLE_BASE_ID_INDIVIDUAL');
   process.exit(1);
 }
 
-/* ===== APP ===== */
 const app = express();
 app.use(cors());
 app.use(express.json());
@@ -31,7 +31,6 @@ const atGlobal = AIRTABLE_BASE_ID_GLOBAL
   ? new Airtable({ apiKey: AIRTABLE_API_KEY }).base(AIRTABLE_BASE_ID_GLOBAL)
   : null;
 
-/* ===== Helpers ===== */
 const norm = v => (Array.isArray(v) ? v[0] : v ?? '').toString();
 const normSlug = v => norm(v).trim().toLowerCase();
 const sanitizeForFormula = s => norm(s).replace(/"/g, '').replace(/'/g, '’');
@@ -89,7 +88,19 @@ function uvjetiText(rows) {
   ].filter(Boolean).join(' | ');
 }
 
-/* ===== Slug → škola ===== */
+const TABLES = {
+  kategorije: ['KATEGORIJE', 'KATEGORIJE AUTOŠKOLE'],
+  cjenik: ['CJENIK', 'CJENIK I PRAVILA'],
+  hak: ['PLAĆANJE HAK-u', 'NAKNADE ZA POLAGANJE'],
+  uvjeti: ['UVJETI PLAĆANJA'],
+  dodatne: ['DODATNE USLUGE'],
+  instruktori: ['INSTRUKTORI'],
+  vozni: ['VOZNI PARK'],
+  lokacije: ['LOKACIJE', 'LOKACIJE & PARTNERI'],
+  nastava: ['NASTAVA & PREDAVANJA'],
+  upisi: ['UPIŠI SE ONLINE']
+};
+
 async function getSchoolRow(slug) {
   const safe = sanitizeForFormula(slug || DEFAULT_SLUG);
   try {
@@ -107,20 +118,6 @@ async function getSchoolRow(slug) {
     return {};
   }
 }
-
-/* ===== Tablice ===== */
-const TABLES = {
-  kategorije: ['KATEGORIJE', 'KATEGORIJE AUTOŠKOLE'],
-  cjenik: ['CJENIK', 'CJENIK I PRAVILA'],
-  hak: ['PLAĆANJE HAK-u', 'NAKNADE ZA POLAGANJE'],
-  uvjeti: ['UVJETI PLAĆANJA'],
-  dodatne: ['DODATNE USLUGE'],
-  instruktori: ['INSTRUKTORI'],
-  vozni: ['VOZNI PARK'],
-  lokacije: ['LOKACIJE', 'LOKACIJE & PARTNERI'],
-  nastava: ['NASTAVA & PREDAVANJA'],
-  upisi: ['UPIŠI SE ONLINE']
-};
 
 async function getBySlugMulti(nameVariants, slug) {
   const safeSlug = sanitizeForFormula(slug || DEFAULT_SLUG);
@@ -140,7 +137,6 @@ async function getBySlugMulti(nameVariants, slug) {
 function extractFacts(userText, data, school) {
   const t = norm(userText).toLowerCase();
 
-  // Lokacija autoškole
   if (t.includes('adresa') || t.includes('gdje ste') || t.includes('gdje se nalazite') || t.includes('lokacija')) {
     const adr = norm(school['Adresa']);
     const maps = norm(school['Google Maps'] || school['Maps'] || school['Geo_URL']);
@@ -157,25 +153,21 @@ function extractFacts(userText, data, school) {
     if (alt) return `ADRESA AUTOŠKOLE:\n• ${alt}`;
   }
 
-  // Poligon
   if (t.includes('poligon') || t.includes('vježbalište')) {
     const pol = findLocation(data.lokacije, 'poligon');
     if (pol) return `POLIGON:\n• ${pol}`;
   }
 
-  // Prva pomoć
   if (t.includes('prva pomoć')) {
     const pp = findLocation(data.lokacije, 'prva pomoć');
     if (pp) return `PRVA POMOĆ:\n• ${pp}`;
   }
 
-  // Plaćanje
   if (t.includes('kartic') || t.includes('rate') || t.includes('plaćan')) {
     const u = uvjetiText(data.uvjeti);
     if (u) return `UVJETI PLAĆANJA:\n${u}`;
   }
 
-  // Vozni park
   if (t.includes('vozni park') || t.includes('vozila')) {
     let kat = '';
     for (const k of ['am', 'a1', 'a2', 'a', 'b', 'c', 'ce', 'd']) {
@@ -185,7 +177,6 @@ function extractFacts(userText, data, school) {
     if (list) return `VOZNI PARK${kat ? ` – Kategorija ${kat}` : ''}:\n${list}`;
   }
 
-  // Satnica
   if (t.includes('koliko sati') || t.includes('satnica') || t.includes('teorija') || t.includes('praksa')) {
     const kat = ['am', 'a1', 'a2', 'a', 'b', 'c', 'ce', 'd'].find(k => t.includes(k));
     const row = data.kategorije.find(k => norm(k['Kategorija'])?.toLowerCase() === kat);
@@ -237,7 +228,6 @@ function buildSystemPrompt(school, data, globalBlocks, facts) {
 
   const vozniPark = listVehicles(data.vozni, '');
   const poligon = findLocation(data.lokacije, 'poligon');
-
   const globalJoined = (globalBlocks.globalRules || []).map(g => `• ${g.title}: ${g.body}`).join('\n');
 
   return `
@@ -330,9 +320,17 @@ app.all('/api/ask', async (req, res) => {
     });
 
     const reply = chat.choices?.[0]?.message?.content?.trim();
-    if (!reply) return res.status(500).json({ ok: false, error: 'Empty response from OpenAI' });
+    if (!reply || reply === '...') {
+      return res.json({
+        ok: true,
+        reply: "Nažalost, trenutno nemam dovoljno informacija za to pitanje. Slobodno pitaj nešto drugo!"
+      });
+    }
 
-    res.json({ ok: true, reply });
+    res.json({
+      ok: true,
+      reply: `${reply}\n\n(Ovaj odgovor koristi prompt verziju ${promptVersion})`
+    });
   } catch (e) {
     console.error('API_ERROR', e.message);
     res.status(500).json({ ok: false, error: e.message });
