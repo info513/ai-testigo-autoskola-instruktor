@@ -165,30 +165,57 @@ async function getBySlugMulti(nameVariants, slug) {
   return [];
 }
 
+/* >>> NEW: get all rows without slug filter — used ONLY for FAQ <<< */
+async function getAllNoSlug(nameVariants) {
+  for (const name of nameVariants) {
+    try {
+      const all = await atInd(name).select({ maxRecords: 500 }).all();
+      if (all?.length) return all.map(r => r.fields);
+    } catch {}
+  }
+  return [];
+}
+
 /* ===== FAQ pretraživanje ===== */
 function answerFromFAQ(userText, faqRows) {
   if (!faqRows?.length) return '';
   const q = softNorm(userText);
   const active = faqRows.filter(r => String(r['AKTIVNO'] ?? r['Aktivno'] ?? true) !== 'false');
 
-  // 1) točno/substring poklapanje
+  // helper: split multiple values by | , or newline
+  const splitMulti = (s) =>
+    norm(s)
+      .split(/\r?\n|\|/g)
+      .flatMap(x => x.split(','))
+      .map(x => x.trim())
+      .filter(Boolean);
+
+  // 1) točno/substring poklapanje (na Pitanja + Primjeri upita + Ključne riječi)
   for (const r of active) {
-    const pit = norm(r['PITANJA'] || r['Pitanje'] || r['Pitanja']);
-    if (!pit) continue;
-    if (q.includes(softNorm(pit)) || softNorm(pit).includes(q)) {
-      return norm(r['ODGOVORI'] || r['Odgovor'] || r['Odgovori']);
+    const qList = [
+      ...splitMulti(r['PITANJA'] || r['Pitanja'] || r['Pitanje']),
+      ...splitMulti(r['Primjeri upita'] || r['Primjer upita'] || '')
+    ];
+    if (qList.some(item => {
+      const sn = softNorm(item);
+      return sn && (q.includes(sn) || sn.includes(q));
+    })) {
+      const ans = norm(r['ODGOVORI'] || r['Odgovor'] || r['Odgovori']);
+      if (ans) return ans;
     }
   }
 
-  // 2) fuzzy – najveće preklapanje riječi (uz "Ključne riječi" ako postoji)
+  // 2) fuzzy – najveće preklapanje riječi (Pitanja + Ključne riječi)
   let best = { score: 0, ans: '' };
   for (const r of active) {
-    const pit = norm(r['PITANJA'] || r['Pitanje'] || r['Pitanja']);
+    const allQ = [
+      ...splitMulti(r['PITANJA'] || r['Pitanja'] || r['Pitanje']),
+      ...splitMulti(r['Ključne riječi'] || r['Kljucne rijeci'] || '')
+    ].join('\n');
     const ans = norm(r['ODGOVORI'] || r['Odgovor'] || r['Odgovori']);
-    if (!pit || !ans) continue;
-    const s1 = overlapScore(q, pit);
-    const s2 = overlapScore(q, norm(r['Ključne riječi'] || r['Kljucne rijeci'] || ''));
-    const score = s1 + Math.min(2, s2);
+    if (!allQ || !ans) continue;
+
+    const score = overlapScore(q, allQ);
     if (score > best.score) best = { score, ans };
   }
   return best.score >= 2 ? best.ans : '';
@@ -477,7 +504,12 @@ app.all('/api/ask', async (req, res) => {
 
     const data = {};
     for (const [key, variants] of Object.entries(TABLES)) {
-      data[key] = await getBySlugMulti(variants, slug);
+      // >>> Jedina promjena: FAQ se učitava BEZ slug filtera (globalno) <<<
+      if (key === 'faq') {
+        data[key] = await getAllNoSlug(variants);
+      } else {
+        data[key] = await getBySlugMulti(variants, slug);
+      }
     }
 
     /* ❶ Odgovor iz FAQ-a (ako postoji) — bez OpenAI poziva */
@@ -542,7 +574,12 @@ app.get('/api/debug', async (req, res) => {
   const school = await getSchoolRow(slug);
   const data = {};
   for (const [key, variants] of Object.entries(TABLES)) {
-    data[key] = await getBySlugMulti(variants, slug);
+    // i ovdje: FAQ bez sluga, ostalo kao prije
+    if (key === 'faq') {
+      data[key] = await getAllNoSlug(variants);
+    } else {
+      data[key] = await getBySlugMulti(variants, slug);
+    }
   }
   res.json({ ok: true, slug, school, data });
 });
