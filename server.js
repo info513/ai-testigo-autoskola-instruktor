@@ -1,4 +1,4 @@
-// server.js  — AI Testigo (INDIVIDUAL only, category summary, timeout)
+// server.js  — AI Testigo (INDIVIDUAL only, category summary, timeout, FAQ first)
 import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
@@ -33,6 +33,23 @@ const atInd = new Airtable({ apiKey: AIRTABLE_API_KEY }).base(AIRTABLE_BASE_ID_I
 const norm = v => (Array.isArray(v) ? v[0] : v ?? '').toString();
 const normSlug = v => norm(v).trim().toLowerCase();
 const sanitizeForFormula = s => norm(s).replace(/"/g, '').replace(/'/g, '’');
+
+function softNorm(s = '') {
+  return norm(s)
+    .toLowerCase()
+    .normalize('NFD').replace(/[\u0300-\u036f]/g, '') // ukloni dijakritike
+    .replace(/[^a-z0-9ćčđšž\s]/gi, ' ')              // makni simbole
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function overlapScore(q, candidate) {
+  const qs = new Set(softNorm(q).split(' ').filter(w => w.length >= 3));
+  const cs = new Set(softNorm(candidate).split(' ').filter(w => w.length >= 3));
+  let score = 0;
+  for (const w of qs) if (cs.has(w)) score++;
+  return score;
+}
 
 function convertToEuro(value) {
   const v = norm(value).trim();
@@ -78,7 +95,9 @@ function findLocation(rows, needle) {
   const naziv = norm(row['Naziv ustanove / partnera'] || row['Naziv'] || 'Lokacija');
   const adresa = norm(row['Adresa'] || row['Lokacija']);
   const grad = norm(row['Mjesto'] || row['Grad']);
-  const url = norm(row['Geo_URL'] || row['URL'] || row['Maps'] || row['Google Maps'] || row['Link na Google Maps']);
+  const url = norm(
+    row['Geo_URL'] || row['URL'] || row['Maps'] || row['Google Maps'] || row['Link na Google Maps']
+  );
   return `${naziv}${adresa ? ', ' + adresa : ''}${grad ? ', ' + grad : ''}${url ? ' | Mapa: ' + url : ''}`;
 }
 
@@ -107,7 +126,8 @@ const TABLES = {
   vozni: ['VOZNI PARK'],
   lokacije: ['LOKACIJE', 'LOKACIJE & PARTNERI'],
   nastava: ['NASTAVA & PREDAVANJA'],
-  upisi: ['UPIŠI SE ONLINE']
+  upisi: ['UPIŠI SE ONLINE'],
+  faq: ['FAQ - Odgovori na pitanja', 'FAQ', 'FAQ – Odgovori', 'FAQ Odgovori'] // DODANO
 };
 
 /* ===== Data access ===== */
@@ -145,6 +165,35 @@ async function getBySlugMulti(nameVariants, slug) {
   return [];
 }
 
+/* ===== FAQ pretraživanje ===== */
+function answerFromFAQ(userText, faqRows) {
+  if (!faqRows?.length) return '';
+  const q = softNorm(userText);
+  const active = faqRows.filter(r => String(r['AKTIVNO'] ?? r['Aktivno'] ?? true) !== 'false');
+
+  // 1) točno/substring poklapanje
+  for (const r of active) {
+    const pit = norm(r['PITANJA'] || r['Pitanje'] || r['Pitanja']);
+    if (!pit) continue;
+    if (q.includes(softNorm(pit)) || softNorm(pit).includes(q)) {
+      return norm(r['ODGOVORI'] || r['Odgovor'] || r['Odgovori']);
+    }
+  }
+
+  // 2) fuzzy – najveće preklapanje riječi (uz "Ključne riječi" ako postoji)
+  let best = { score: 0, ans: '' };
+  for (const r of active) {
+    const pit = norm(r['PITANJA'] || r['Pitanje'] || r['Pitanja']);
+    const ans = norm(r['ODGOVORI'] || r['Odgovor'] || r['Odgovori']);
+    if (!pit || !ans) continue;
+    const s1 = overlapScore(q, pit);
+    const s2 = overlapScore(q, norm(r['Ključne riječi'] || r['Kljucne rijeci'] || ''));
+    const score = s1 + Math.min(2, s2);
+    if (score > best.score) best = { score, ans };
+  }
+  return best.score >= 2 ? best.ans : '';
+}
+
 /* ===== Sastavljanje kompletnog odgovora po kategoriji (bez “maštanja”) ===== */
 function buildCategorySummary(katRaw, data) {
   if (!katRaw) return '';
@@ -156,8 +205,12 @@ function buildCategorySummary(katRaw, data) {
   if (rowK) {
     const te = norm(rowK['Broj sati teorija'] || rowK['Broj_sati_teorija']);
     const pr = norm(rowK['Broj sati praksa']  || rowK['Broj_sati_praksa']);
-    const trajanje = norm(rowK['Trajanje (tipično)']); // ako dodaš ovo polje u Airtable, bit će prikazano
+    const trajanje = norm(rowK['Trajanje (tipično)']);
+    const minDob = norm(rowK['Minimalna dob'] || rowK['Minimalna_dob']);
+    const uvjetiUpisa = norm(rowK['Uvjeti upisa'] || rowK['Uvjeti_upisa']);
     satnica = `• Sati: Teorija ${te || '?'}h, Praksa ${pr || '?'}h${trajanje ? ` | Trajanje (tipično): ${trajanje}` : ''}`;
+    if (minDob) satnica += `\n• Minimalna dob: ${minDob} godina`;
+    if (uvjetiUpisa) satnica += `\n• Uvjeti upisa: ${uvjetiUpisa}`;
   }
 
   // 2) Cijene (CJENIK)
@@ -221,6 +274,24 @@ function extractFacts(userText, data, school) {
     if (pack) return pack;
   }
 
+  // Minimalna dob
+  if (wanted && (t.includes('minimalna dob') || t.includes('koliko godina') || t.includes('godina'))) {
+    const row = (data.kategorije || []).find(r => norm(r['Kategorija']).toLowerCase() === wanted);
+    if (row) {
+      const md = norm(row['Minimalna dob'] || row['Minimalna_dob']);
+      if (md) return `MINIMALNA DOB ZA ${wanted.toUpperCase()}:\n• ${md} godina`;
+    }
+  }
+
+  // Uvjeti upisa / dokumenti
+  if (wanted && (t.includes('uvjeti upisa') || t.includes('dokument') || t.includes('što trebam ponijeti') || t.includes('sto moram ponijeti'))) {
+    const row = (data.kategorije || []).find(r => norm(r['Kategorija']).toLowerCase() === wanted);
+    if (row) {
+      const uv = norm(row['Uvjeti upisa'] || row['Uvjeti_upisa']);
+      if (uv) return `UVJETI UPISA ZA ${wanted.toUpperCase()}:\n• ${uv}`;
+    }
+  }
+
   if (t.includes('adresa') || t.includes('gdje ste') || t.includes('gdje se nalazite') || t.includes('lokacija')) {
     const adr = norm(school['Adresa']);
     const maps = norm(school['Google Maps'] || school['Maps'] || school['Geo_URL'] || school['Link na Google Maps']);
@@ -245,6 +316,11 @@ function extractFacts(userText, data, school) {
   if (t.includes('prva pomoć')) {
     const pp = findLocation(data.lokacije, 'prva pomoć');
     if (pp) return `PRVA POMOĆ:\n• ${pp}`;
+  }
+
+  if (t.includes('liječnič') || t.includes('lijecnick') || t.includes('medicina rada') || t.includes('pregled')) {
+    const med = findLocation(data.lokacije, 'medicina rada');
+    if (med) return `MEDICINA RADA – Liječnički pregled:\n• ${med}`;
   }
 
   if (t.includes('kartic') || t.includes('rate') || t.includes('plaćan')) {
@@ -404,6 +480,16 @@ app.all('/api/ask', async (req, res) => {
       data[key] = await getBySlugMulti(variants, slug);
     }
 
+    /* ❶ Odgovor iz FAQ-a (ako postoji) — bez OpenAI poziva */
+    const faqAnswer = answerFromFAQ(userMessage, data.faq);
+    if (faqAnswer) {
+      return res.json({
+        ok: true,
+        reply: `${faqAnswer}\n\n(Odgovor iz FAQ baze)`
+      });
+    }
+
+    /* Heuristike iz tablica (adrese, poligon, sati itd.) */
     const facts = extractFacts(userMessage, data, safeSchool);
     const systemPrompt = buildSystemPrompt(safeSchool, data, facts);
 
