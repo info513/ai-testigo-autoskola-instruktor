@@ -221,6 +221,14 @@ function answerFromFAQ(userText, faqRows) {
   return best.score >= 2 ? best.ans : '';
 }
 
+/* >>> NEW: detektor upita o kategorijama/cijenama — da FAQ ne preuzme takve upite <<< */
+function isCategoryOrPriceQuery(s) {
+  const q = softNorm(s);
+  const hasKat = /\b(am|a1|a2|a|b|c|ce|d|f|g)\b/.test(q) || /kategor/i.test(q);
+  const hasBizWords = /(cijena|cijene|sati|satnica|hak|naknad|paket|minimalna dob|uvjeti upisa|vozni park|vozila|sve info|informacije)/i.test(q);
+  return hasKat || hasBizWords;
+}
+
 /* ===== Sastavljanje kompletnog odgovora po kategoriji (bez “maštanja”) ===== */
 function buildCategorySummary(katRaw, data) {
   if (!katRaw) return '';
@@ -393,7 +401,7 @@ function buildSystemPrompt(school, data, facts) {
 
   const kategorije = (data.kategorije || []).map(k => {
     const naziv = norm(k['Kategorija'] || k['Naziv']);
-    const teorija = norm(k['Broj sati teorija'] || k['Broj_sati_teorija']);
+       const teorija = norm(k['Broj sati teorija'] || k['Broj_sati_teorija']);
     const praksa  = norm(k['Broj sati praksa']  || k['Broj_sati_praksa']);
     return `• ${naziv}: Teorija ${teorija}h | Praksa ${praksa}h`;
   }).filter(Boolean).join('\n');
@@ -504,7 +512,7 @@ app.all('/api/ask', async (req, res) => {
 
     const data = {};
     for (const [key, variants] of Object.entries(TABLES)) {
-      // >>> Jedina promjena: FAQ se učitava BEZ slug filtera (globalno) <<<
+      // FAQ se učitava BEZ slug filtera (globalno)
       if (key === 'faq') {
         data[key] = await getAllNoSlug(variants);
       } else {
@@ -512,9 +520,9 @@ app.all('/api/ask', async (req, res) => {
       }
     }
 
-    /* ❶ Odgovor iz FAQ-a (ako postoji) — bez OpenAI poziva */
+    /* ❶ FAQ odgovor — koristi se SAMO ako nije pitanje o kategorijama/cijenama/satima/HAK-u */
     const faqAnswer = answerFromFAQ(userMessage, data.faq);
-    if (faqAnswer) {
+    if (faqAnswer && !isCategoryOrPriceQuery(userMessage)) {
       return res.json({
         ok: true,
         reply: `${faqAnswer}\n\n(Odgovor iz FAQ baze)`
