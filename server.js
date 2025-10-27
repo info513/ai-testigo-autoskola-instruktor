@@ -184,7 +184,7 @@ function answerFromFAQ_STRICT(userText, faqRows) {
   const qRaw = userText;
   const q = softNorm(userText);
 
-  // ✅ Guard: prekratki/ambigusni upiti NE aktiviraju FAQ
+  // prekratki/ambigusni upiti NE aktiviraju FAQ
   const wordCount = q.split(' ').filter(Boolean).length;
   if (wordCount <= 3 || q.length < 12) return '';
 
@@ -226,7 +226,6 @@ function answerFromFAQ_STRICT(userText, faqRows) {
 function isCategoryOrPriceQuery(s) {
   const q = softNorm(s);
   const hasKat = /\b(am|a1|a2|a|b|c|ce|d|f|g)\b/.test(q) || /kategor/.test(q);
-  // bez dijakritike + tolerantno na razmake
   const hasBizWords =
     /(cijena|cijene|koliko\s*kosta|kosta|sati|satnica|hak|naknad|paket|minimalna\s*dob|uvjeti\s*upisa|vozni\s*park|vozila|informacij|upis|teorij|praksa|voznj)/.test(q);
   return hasKat || hasBizWords;
@@ -236,7 +235,7 @@ function isCategoryOrPriceQuery(s) {
 function extractAIPromptSections(allData, slug) {
   const sectionLines = [];
 
-  const keys = Object.keys(allData).filter(k => k !== 'faq'); // FAQ ne treba AI_* okvire
+  const keys = Object.keys(allData).filter(k => k !== 'faq');
   for (const key of keys) {
     const rows = allData[key] || [];
     if (!rows.length) continue;
@@ -438,7 +437,8 @@ function buildSystemPrompt(school, data, facts, aiSections) {
   const pravila = norm(school['AI_PRAVILA'] || 'Odgovaraj isključivo prema INDIVIDUAL podacima. Ne nagađaj.');
   const uvod = norm(school['AI_POZDRAV'] || 'Bok! 👋 Kako ti mogu pomoći oko upisa, cijena ili termina?');
 
-  const tel = norm(school['Telefon'] || school['Telefon (fiksni)'] || school['Mobitel']));
+  // ✅ FIX: maknut višak zagrade
+  const tel = norm(school['Telefon'] || school['Telefon (fiksni)'] || school['Mobitel']);
   const web = norm(school['Web'] || school['Web stranica']);
   const mail = norm(school['Email'] || school['E-mail']);
 
@@ -558,25 +558,19 @@ app.all('/api/ask', async (req, res) => {
 
     const data = {};
     for (const [key, variants] of Object.entries(TABLES)) {
-      if (key === 'faq') {
-        data[key] = await getAllNoSlug(variants); // FAQ je globalan
-      } else {
-        data[key] = await getBySlugMulti(variants, slug);
-      }
+      if (key === 'faq') data[key] = await getAllNoSlug(variants);
+      else data[key] = await getBySlugMulti(variants, slug);
     }
 
-    /* ❶ FAQ (STROGO) — samo ako NIJE upit o kategorijama/cijenama/satima/HAK-u */
+    // ❶ FAQ (STROGO) — samo ako NIJE upit o kategorijama/cijenama/satima/HAK-u
     if (!isCategoryOrPriceQuery(userMessage)) {
       const faqAnswer = answerFromFAQ_STRICT(userMessage, data.faq);
       if (faqAnswer) {
-        return res.json({
-          ok: true,
-          reply: `${faqAnswer}\n\n(Odgovor iz FAQ baze)`
-        });
+        return res.json({ ok: true, reply: `${faqAnswer}\n\n(Odgovor iz FAQ baze)` });
       }
     }
 
-    /* Heuristike + AI prompt okviri iz tablica */
+    // Heuristike + AI prompt okviri iz tablica
     const facts = extractFacts(userMessage, data, safeSchool);
     const aiSections = extractAIPromptSections(data, slug);
     const systemPrompt = buildSystemPrompt(safeSchool, data, facts, aiSections);
@@ -603,4 +597,39 @@ app.all('/api/ask', async (req, res) => {
       console.error('OPENAI_CALL_ERROR', err?.message);
       return res.json({
         ok: true,
-        reply: "Trenutno ne mogu dohvatiti odgovor od AI modela. Pokušaj ponovno ili pitaj konkretnije (npr.
+        reply: "Trenutno ne mogu dohvatiti odgovor od AI modela. Pokušaj ponovno ili pitaj konkretnije (npr. 'Cijene i sati za A kategoriju')."
+      });
+    }
+
+    if (!reply || reply === '...') {
+      return res.json({ ok: true, reply: "Nažalost, nisam uspio generirati odgovor. Pokušaj ponovno konkretnije." });
+    }
+
+    res.json({ ok: true, reply: `${reply}\n\n(Ovaj odgovor koristi prompt verziju ${promptVersion})` });
+  } catch (e) {
+    console.error('API_ERROR', e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+/* ===== Debug & Health ===== */
+app.get('/api/debug', async (req, res) => {
+  const slug = normSlug(req.query.slug || DEFAULT_SLUG);
+  const school = await getSchoolRow(slug);
+  const data = {};
+  for (const [key, variants] of Object.entries(TABLES)) {
+    if (key === 'faq') data[key] = await getAllNoSlug(variants);
+    else data[key] = await getBySlugMulti(variants, slug);
+  }
+  const aiSections = extractAIPromptSections(data, slug);
+  res.json({ ok: true, slug, school, data, aiSections });
+});
+
+app.get('/api/health', (req, res) => {
+  res.json({ ok: true, status: 'AI agent radi ✅', time: new Date().toISOString() });
+});
+
+/* ===== Start ===== */
+app.listen(PORT, () => {
+  console.log(`✅ AI Testigo agent (INDIVIDUAL only) radi na portu :${PORT}`);
+});
