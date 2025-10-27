@@ -1,4 +1,4 @@
-// server.js  — AI Testigo (INDIVIDUAL only, category summary, timeout, FAQ first)
+// server.js  — AI Testigo (INDIVIDUAL only, strict FAQ, AI_* prompts, category summary, timeout)
 import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
@@ -15,7 +15,7 @@ const {
   SCHOOL_SLUG: DEFAULT_SLUG = 'instruktor'
 } = process.env;
 
-const promptVersion = 'v1.4.0';
+const promptVersion = 'v1.5.0';
 
 if (!OPENAI_API_KEY || !AIRTABLE_API_KEY || !AIRTABLE_BASE_ID_INDIVIDUAL) {
   console.error('❗ Nedostaju env varijable: OPENAI_API_KEY, AIRTABLE_API_KEY ili AIRTABLE_BASE_ID_INDIVIDUAL');
@@ -37,18 +37,22 @@ const sanitizeForFormula = s => norm(s).replace(/"/g, '').replace(/'/g, '’');
 function softNorm(s = '') {
   return norm(s)
     .toLowerCase()
-    .normalize('NFD').replace(/[\u0300-\u036f]/g, '') // ukloni dijakritike
-    .replace(/[^a-z0-9ćčđšž\s]/gi, ' ')              // makni simbole
+    .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^a-z0-9ćčđšž\s]/gi, ' ')
     .replace(/\s+/g, ' ')
     .trim();
 }
 
+function wordSet(s) {
+  return new Set(softNorm(s).split(' ').filter(w => w.length >= 3));
+}
 function overlapScore(q, candidate) {
-  const qs = new Set(softNorm(q).split(' ').filter(w => w.length >= 3));
-  const cs = new Set(softNorm(candidate).split(' ').filter(w => w.length >= 3));
-  let score = 0;
-  for (const w of qs) if (cs.has(w)) score++;
-  return score;
+  const qs = wordSet(q);
+  const cs = wordSet(candidate);
+  let overlap = 0;
+  for (const w of qs) if (cs.has(w)) overlap++;
+  const jaccard = qs.size ? overlap / (qs.size + cs.size - overlap || 1) : 0;
+  return { overlap, qsSize: qs.size, csSize: cs.size, jaccard };
 }
 
 function convertToEuro(value) {
@@ -95,9 +99,7 @@ function findLocation(rows, needle) {
   const naziv = norm(row['Naziv ustanove / partnera'] || row['Naziv'] || 'Lokacija');
   const adresa = norm(row['Adresa'] || row['Lokacija']);
   const grad = norm(row['Mjesto'] || row['Grad']);
-  const url = norm(
-    row['Geo_URL'] || row['URL'] || row['Maps'] || row['Google Maps'] || row['Link na Google Maps']
-  );
+  const url = norm(row['Geo_URL'] || row['URL'] || row['Maps'] || row['Google Maps'] || row['Link na Google Maps']);
   return `${naziv}${adresa ? ', ' + adresa : ''}${grad ? ', ' + grad : ''}${url ? ' | Mapa: ' + url : ''}`;
 }
 
@@ -127,7 +129,7 @@ const TABLES = {
   lokacije: ['LOKACIJE', 'LOKACIJE & PARTNERI'],
   nastava: ['NASTAVA & PREDAVANJA'],
   upisi: ['UPIŠI SE ONLINE'],
-  faq: ['FAQ - Odgovori na pitanja', 'FAQ', 'FAQ – Odgovori', 'FAQ Odgovori'] // DODANO
+  faq: ['FAQ - Odgovori na pitanja', 'FAQ', 'FAQ – Odgovori', 'FAQ Odgovori'] // globalni FAQ
 };
 
 /* ===== Data access ===== */
@@ -165,7 +167,7 @@ async function getBySlugMulti(nameVariants, slug) {
   return [];
 }
 
-/* >>> NEW: get all rows without slug filter — used ONLY for FAQ <<< */
+/* get all rows without slug filter — ONLY for FAQ (univerzalna tablica) */
 async function getAllNoSlug(nameVariants) {
   for (const name of nameVariants) {
     try {
@@ -176,13 +178,13 @@ async function getAllNoSlug(nameVariants) {
   return [];
 }
 
-/* ===== FAQ pretraživanje ===== */
-function answerFromFAQ(userText, faqRows) {
+/* ===== Strict FAQ pretraživanje ===== */
+function answerFromFAQ_STRICT(userText, faqRows) {
   if (!faqRows?.length) return '';
+  const qRaw = userText;
   const q = softNorm(userText);
   const active = faqRows.filter(r => String(r['AKTIVNO'] ?? r['Aktivno'] ?? true) !== 'false');
 
-  // helper: split multiple values by | , or newline
   const splitMulti = (s) =>
     norm(s)
       .split(/\r?\n|\|/g)
@@ -190,46 +192,84 @@ function answerFromFAQ(userText, faqRows) {
       .map(x => x.trim())
       .filter(Boolean);
 
-  // 1) točno/substring poklapanje (na Pitanja + Primjeri upita + Ključne riječi)
+  let best = { score: 0, jaccard: 0, ans: '' };
+
   for (const r of active) {
     const qList = [
       ...splitMulti(r['PITANJA'] || r['Pitanja'] || r['Pitanje']),
-      ...splitMulti(r['Primjeri upita'] || r['Primjer upita'] || '')
-    ];
-    if (qList.some(item => {
-      const sn = softNorm(item);
-      return sn && (q.includes(sn) || sn.includes(q));
-    })) {
-      const ans = norm(r['ODGOVORI'] || r['Odgovor'] || r['Odgovori']);
-      if (ans) return ans;
+      ...splitMulti(r['Primjeri upita'] || r['Primjer upita'] || ''),
+      ...splitMulti(r['Ključne riječi'] || r['Kljucne rijeci'] || '')
+    ].filter(Boolean);
+
+    for (const cand of qList) {
+      const { overlap, qsSize, jaccard } = overlapScore(qRaw, cand);
+      // STRIKTNA PRAVILA:
+      // - ili (A) gotovo identičan tekst (substring u oba smjera)
+      // - ili (B) dovoljno jak “semantic-like” signal: >=3 zajedničke riječi i Jaccard >= 0.45
+      const sn = softNorm(cand);
+      const almostExact = (sn && (q.includes(sn) || sn.includes(q))) && Math.min(q.length, sn.length) >= 12;
+
+      if (almostExact || (overlap >= 3 && jaccard >= 0.45 && qsSize >= 5)) {
+        const ans = norm(r['ODGOVORI'] || r['Odgovor'] || r['Odgovori']);
+        if (ans && (overlap > best.score || (overlap === best.score && jaccard > best.jaccard))) {
+          best = { score: overlap, jaccard, ans };
+        }
+      }
     }
   }
-
-  // 2) fuzzy – najveće preklapanje riječi (Pitanja + Ključne riječi)
-  let best = { score: 0, ans: '' };
-  for (const r of active) {
-    const allQ = [
-      ...splitMulti(r['PITANJA'] || r['Pitanja'] || r['Pitanje']),
-      ...splitMulti(r['Ključne riječi'] || r['Kljucne rijeci'] || '')
-    ].join('\n');
-    const ans = norm(r['ODGOVORI'] || r['Odgovor'] || r['Odgovori']);
-    if (!allQ || !ans) continue;
-
-    const score = overlapScore(q, allQ);
-    if (score > best.score) best = { score, ans };
-  }
-  return best.score >= 2 ? best.ans : '';
+  return best.ans || '';
 }
 
-/* >>> NEW: detektor upita o kategorijama/cijenama — da FAQ ne preuzme takve upite <<< */
+/* ===== Detektor upita o kategorijama/cijenama — da FAQ ne preuzme to ===== */
 function isCategoryOrPriceQuery(s) {
   const q = softNorm(s);
   const hasKat = /\b(am|a1|a2|a|b|c|ce|d|f|g)\b/.test(q) || /kategor/i.test(q);
-  const hasBizWords = /(cijena|cijene|sati|satnica|hak|naknad|paket|minimalna dob|uvjeti upisa|vozni park|vozila|sve info|informacije)/i.test(q);
+  const hasBizWords = /(cijena|cijene|kolik(o|a) košta|sati|satnica|hak|naknad|paket|minimalna dob|uvjeti upisa|vozni park|vozila|informacij|upis|teorij|praksa|vožnj)/i.test(q);
   return hasKat || hasBizWords;
 }
 
-/* ===== Sastavljanje kompletnog odgovora po kategoriji (bez “maštanja”) ===== */
+/* ===== AI prompt okviri iz tablica (AI_CONTEXT/… ) ===== */
+function extractAIPromptSections(allData, slug) {
+  const sectionLines = [];
+
+  const keys = Object.keys(allData).filter(k => k !== 'faq'); // FAQ ne treba AI_* okvire
+  for (const key of keys) {
+    const rows = allData[key] || [];
+    if (!rows.length) continue;
+
+    // uzmi prvi red koji ima barem jedno AI_* polje (i po mogućnosti isti Slug)
+    const row = rows.find(r =>
+      Object.keys(r).some(f => f.startsWith('AI_')) &&
+      (normSlug(r.Slug || r['Slug (autoškola)'] || r['Slug (Autoškola)'] || r['slug (autoškola)']) === normSlug(slug) || !r.Slug)
+    ) || rows.find(r => Object.keys(r).some(f => f.startsWith('AI_')));
+
+    if (!row) continue;
+
+    const ctx   = norm(row.AI_CONTEXT);
+    const patt  = norm(row.AI_INTENT_PATTERNS);
+    const rules = norm(row.AI_OUTPUT_RULES);
+    const dis   = norm(row.AI_DISAMBIGUATION);
+    const fb    = norm(row.AI_FALLBACK);
+
+    const any = [ctx, patt, rules, dis, fb].some(Boolean);
+    if (!any) continue;
+
+    sectionLines.push(
+      [
+        `=== AI INSTRUKCIJE ZA TABLICU ${key.toUpperCase()} ===`,
+        ctx   ? `Kontekst: ${ctx}` : '',
+        patt  ? `Namjere (uzorci): ${patt}` : '',
+        rules ? `Pravila izlaza: ${rules}` : '',
+        dis   ? `Rasplitanje/pojašnjenje: ${dis}` : '',
+        fb    ? `Fallback kad nema podatka: ${fb}` : ''
+      ].filter(Boolean).join('\n')
+    );
+  }
+
+  return sectionLines.join('\n\n');
+}
+
+/* ===== Sastavljanje kompletnog odgovora po kategoriji ===== */
 function buildCategorySummary(katRaw, data) {
   if (!katRaw) return '';
   const kat = katRaw.toUpperCase();
@@ -275,7 +315,7 @@ function buildCategorySummary(katRaw, data) {
   const uvjeti = uvjetiText(data.uvjeti);
   const uvjetiSekcija = uvjeti ? `• Uvjeti plaćanja: ${uvjeti}` : '';
 
-  // 5) Dodatni sat (za tu kategoriju)
+  // 5) Dodatni sat
   const dodatni = (data.dodatne || [])
     .filter(d => norm(d['Naziv usluge'] || d['Naziv']).toLowerCase().includes('dodatni sat') &&
                  norm(d['Kategorija']).toUpperCase() === kat)
@@ -388,7 +428,7 @@ function extractFacts(userText, data, school) {
 }
 
 /* ===== Prompt ===== */
-function buildSystemPrompt(school, data, facts) {
+function buildSystemPrompt(school, data, facts, aiSections) {
   const persona = norm(school['AI_PERSONA'] || 'Smiren, stručan instruktor.');
   const ton = norm(school['AI_TON'] || 'prijateljski, jasan');
   const stil = norm(school['AI_STIL'] || 'kratki odlomci; konkretno');
@@ -401,7 +441,7 @@ function buildSystemPrompt(school, data, facts) {
 
   const kategorije = (data.kategorije || []).map(k => {
     const naziv = norm(k['Kategorija'] || k['Naziv']);
-       const teorija = norm(k['Broj sati teorija'] || k['Broj_sati_teorija']);
+    const teorija = norm(k['Broj sati teorija'] || k['Broj_sati_teorija']);
     const praksa  = norm(k['Broj sati praksa']  || k['Broj_sati_praksa']);
     return `• ${naziv}: Teorija ${teorija}h | Praksa ${praksa}h`;
   }).filter(Boolean).join('\n');
@@ -446,7 +486,8 @@ Ti si AI asistent autoškole.
 **Politika odgovaranja (SAMO INDIVIDUAL BAZA):**
 1) Koristi isključivo INDIVIDUAL podatke (tablice + činjenice). Ne koristi vanjske izvore.
 2) Ako podatak ne postoji, reci iskreno da nemaš informaciju i ponudi kontakt. Ne pretpostavljaj i ne izmišljaj.
-3) Ako korisnik pita za konkretnu kategoriju (A, B, C, CE, D...), sastavi sažetak: sati, cijene, HAK, uvjeti plaćanja, dodatni sat.
+3) Za cijene i sate: primarni izvor je CJENIK + KATEGORIJE; HAK naknade iz tablice PLAĆANJE HAK-u; dodatni sat iz DODATNE USLUGE.
+4) Poštuj niže AI okvire (AI_CONTEXT/INTENT_PATTERNS/OUTPUT_RULES/DISAMBIGUATION/FALLBACK) za svaku tablicu.
 
 Osobnost: ${persona}
 Ton: ${ton}
@@ -456,6 +497,8 @@ Pravila: ${pravila}
 Kontakt: ${tel} | ${mail} | ${web} | Radno vrijeme: ${norm(school['Radno_vrijeme'] || school['Radno vrijeme'])}
 
 ${facts ? `\n=== ČINJENICE ZA ODGOVOR ===\n${facts}\n` : ''}
+
+${aiSections ? `\n${aiSections}\n` : ''}
 
 === KATEGORIJE ===
 ${kategorije || '(nema podataka)'}
@@ -512,26 +555,28 @@ app.all('/api/ask', async (req, res) => {
 
     const data = {};
     for (const [key, variants] of Object.entries(TABLES)) {
-      // FAQ se učitava BEZ slug filtera (globalno)
       if (key === 'faq') {
-        data[key] = await getAllNoSlug(variants);
+        data[key] = await getAllNoSlug(variants); // FAQ je globalan
       } else {
         data[key] = await getBySlugMulti(variants, slug);
       }
     }
 
-    /* ❶ FAQ odgovor — koristi se SAMO ako nije pitanje o kategorijama/cijenama/satima/HAK-u */
-    const faqAnswer = answerFromFAQ(userMessage, data.faq);
-    if (faqAnswer && !isCategoryOrPriceQuery(userMessage)) {
-      return res.json({
-        ok: true,
-        reply: `${faqAnswer}\n\n(Odgovor iz FAQ baze)`
-      });
+    /* ❶ FAQ odgovor — koristi se SAMO ako NIJE upit o kategorijama/cijenama/satima/HAK-u i ako je STROGO podudaranje */
+    if (!isCategoryOrPriceQuery(userMessage)) {
+      const faqAnswer = answerFromFAQ_STRICT(userMessage, data.faq);
+      if (faqAnswer) {
+        return res.json({
+          ok: true,
+          reply: `${faqAnswer}\n\n(Odgovor iz FAQ baze)`
+        });
+      }
     }
 
-    /* Heuristike iz tablica (adrese, poligon, sati itd.) */
+    /* Heuristike + AI prompt okviri iz tablica */
     const facts = extractFacts(userMessage, data, safeSchool);
-    const systemPrompt = buildSystemPrompt(safeSchool, data, facts);
+    const aiSections = extractAIPromptSections(data, slug);
+    const systemPrompt = buildSystemPrompt(safeSchool, data, facts, aiSections);
 
     const messages = [
       { role: 'system', content: systemPrompt },
@@ -548,7 +593,7 @@ app.all('/api/ask', async (req, res) => {
           temperature: 0.2,
           max_tokens: 700
         }),
-        20000 // 20s
+        20000
       );
       reply = chat.choices?.[0]?.message?.content?.trim();
     } catch (err) {
@@ -582,14 +627,11 @@ app.get('/api/debug', async (req, res) => {
   const school = await getSchoolRow(slug);
   const data = {};
   for (const [key, variants] of Object.entries(TABLES)) {
-    // i ovdje: FAQ bez sluga, ostalo kao prije
-    if (key === 'faq') {
-      data[key] = await getAllNoSlug(variants);
-    } else {
-      data[key] = await getBySlugMulti(variants, slug);
-    }
+    if (key === 'faq') data[key] = await getAllNoSlug(variants);
+    else data[key] = await getBySlugMulti(variants, slug);
   }
-  res.json({ ok: true, slug, school, data });
+  const aiSections = extractAIPromptSections(data, slug);
+  res.json({ ok: true, slug, school, data, aiSections });
 });
 
 app.get('/api/health', (req, res) => {
