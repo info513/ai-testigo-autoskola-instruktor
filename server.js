@@ -183,6 +183,11 @@ function answerFromFAQ_STRICT(userText, faqRows) {
   if (!faqRows?.length) return '';
   const qRaw = userText;
   const q = softNorm(userText);
+
+  // ✅ Guard: prekratki/ambigusni upiti NE aktiviraju FAQ
+  const wordCount = q.split(' ').filter(Boolean).length;
+  if (wordCount <= 3 || q.length < 12) return '';
+
   const active = faqRows.filter(r => String(r['AKTIVNO'] ?? r['Aktivno'] ?? true) !== 'false');
 
   const splitMulti = (s) =>
@@ -203,9 +208,6 @@ function answerFromFAQ_STRICT(userText, faqRows) {
 
     for (const cand of qList) {
       const { overlap, qsSize, jaccard } = overlapScore(qRaw, cand);
-      // STRIKTNA PRAVILA:
-      // - ili (A) gotovo identičan tekst (substring u oba smjera)
-      // - ili (B) dovoljno jak “semantic-like” signal: >=3 zajedničke riječi i Jaccard >= 0.45
       const sn = softNorm(cand);
       const almostExact = (sn && (q.includes(sn) || sn.includes(q))) && Math.min(q.length, sn.length) >= 12;
 
@@ -223,8 +225,10 @@ function answerFromFAQ_STRICT(userText, faqRows) {
 /* ===== Detektor upita o kategorijama/cijenama — da FAQ ne preuzme to ===== */
 function isCategoryOrPriceQuery(s) {
   const q = softNorm(s);
-  const hasKat = /\b(am|a1|a2|a|b|c|ce|d|f|g)\b/.test(q) || /kategor/i.test(q);
-  const hasBizWords = /(cijena|cijene|kolik(o|a) košta|sati|satnica|hak|naknad|paket|minimalna dob|uvjeti upisa|vozni park|vozila|informacij|upis|teorij|praksa|vožnj)/i.test(q);
+  const hasKat = /\b(am|a1|a2|a|b|c|ce|d|f|g)\b/.test(q) || /kategor/.test(q);
+  // bez dijakritike + tolerantno na razmake
+  const hasBizWords =
+    /(cijena|cijene|koliko\s*kosta|kosta|sati|satnica|hak|naknad|paket|minimalna\s*dob|uvjeti\s*upisa|vozni\s*park|vozila|informacij|upis|teorij|praksa|voznj)/.test(q);
   return hasKat || hasBizWords;
 }
 
@@ -237,7 +241,6 @@ function extractAIPromptSections(allData, slug) {
     const rows = allData[key] || [];
     if (!rows.length) continue;
 
-    // uzmi prvi red koji ima barem jedno AI_* polje (i po mogućnosti isti Slug)
     const row = rows.find(r =>
       Object.keys(r).some(f => f.startsWith('AI_')) &&
       (normSlug(r.Slug || r['Slug (autoškola)'] || r['Slug (Autoškola)'] || r['slug (autoškola)']) === normSlug(slug) || !r.Slug)
@@ -340,7 +343,7 @@ function extractFacts(userText, data, school) {
   const t = norm(userText).toLowerCase();
 
   // “Daj sve info za kategoriju X …”
-  const wanted = ['am','a1','a2','a','b','c','ce','d'].find(k =>
+  const wanted = ['am','a1','a2','a','b','c','ce','d','f','g'].find(k =>
     t.includes(` ${k} `) || t.endsWith(` ${k}`) || t.startsWith(`${k} `) ||
     t.includes(`kategoriju ${k}`) || t.includes(`za ${k} `)
   );
@@ -405,7 +408,7 @@ function extractFacts(userText, data, school) {
 
   if (t.includes('vozni park') || t.includes('vozila')) {
     let kat = '';
-    for (const k of ['am','a1','a2','a','b','c','ce','d']) {
+    for (const k of ['am','a1','a2','a','b','c','ce','d','f','g']) {
       if (t.includes(` ${k} `) || t.endsWith(` ${k}`) || t.startsWith(`${k} `)) { kat = k.toUpperCase(); break; }
     }
     const list = listVehicles(data.vozni, kat);
@@ -413,7 +416,7 @@ function extractFacts(userText, data, school) {
   }
 
   if (t.includes('koliko sati') || t.includes('satnica') || t.includes('teorija') || t.includes('praksa')) {
-    const kat = ['am','a1','a2','a','b','c','ce','d'].find(k =>
+    const kat = ['am','a1','a2','a','b','c','ce','d','f','g'].find(k =>
       t.includes(` ${k} `) || t.endsWith(` ${k}`) || t.startsWith(`${k} `) || t.includes(`${k} kategor`)
     );
     if (kat && Array.isArray(data.kategorije)) {
@@ -435,7 +438,7 @@ function buildSystemPrompt(school, data, facts, aiSections) {
   const pravila = norm(school['AI_PRAVILA'] || 'Odgovaraj isključivo prema INDIVIDUAL podacima. Ne nagađaj.');
   const uvod = norm(school['AI_POZDRAV'] || 'Bok! 👋 Kako ti mogu pomoći oko upisa, cijena ili termina?');
 
-  const tel = norm(school['Telefon'] || school['Telefon (fiksni)'] || school['Mobitel']);
+  const tel = norm(school['Telefon'] || school['Telefon (fiksni)'] || school['Mobitel']));
   const web = norm(school['Web'] || school['Web stranica']);
   const mail = norm(school['Email'] || school['E-mail']);
 
@@ -562,7 +565,7 @@ app.all('/api/ask', async (req, res) => {
       }
     }
 
-    /* ❶ FAQ odgovor — koristi se SAMO ako NIJE upit o kategorijama/cijenama/satima/HAK-u i ako je STROGO podudaranje */
+    /* ❶ FAQ (STROGO) — samo ako NIJE upit o kategorijama/cijenama/satima/HAK-u */
     if (!isCategoryOrPriceQuery(userMessage)) {
       const faqAnswer = answerFromFAQ_STRICT(userMessage, data.faq);
       if (faqAnswer) {
@@ -600,45 +603,4 @@ app.all('/api/ask', async (req, res) => {
       console.error('OPENAI_CALL_ERROR', err?.message);
       return res.json({
         ok: true,
-        reply: "Trenutno ne mogu dohvatiti odgovor od AI modela. Pokušaj ponovno ili pitaj konkretnije (npr. 'Cijene i sati za A kategoriju')."
-      });
-    }
-
-    if (!reply || reply === '...') {
-      return res.json({
-        ok: true,
-        reply: "Nažalost, nisam uspio generirati odgovor. Pokušaj ponovno konkretnije."
-      });
-    }
-
-    res.json({
-      ok: true,
-      reply: `${reply}\n\n(Ovaj odgovor koristi prompt verziju ${promptVersion})`
-    });
-  } catch (e) {
-    console.error('API_ERROR', e.message);
-    res.status(500).json({ ok: false, error: e.message });
-  }
-});
-
-/* ===== Debug & Health ===== */
-app.get('/api/debug', async (req, res) => {
-  const slug = normSlug(req.query.slug || DEFAULT_SLUG);
-  const school = await getSchoolRow(slug);
-  const data = {};
-  for (const [key, variants] of Object.entries(TABLES)) {
-    if (key === 'faq') data[key] = await getAllNoSlug(variants);
-    else data[key] = await getBySlugMulti(variants, slug);
-  }
-  const aiSections = extractAIPromptSections(data, slug);
-  res.json({ ok: true, slug, school, data, aiSections });
-});
-
-app.get('/api/health', (req, res) => {
-  res.json({ ok: true, status: 'AI agent radi ✅', time: new Date().toISOString() });
-});
-
-/* ===== Start ===== */
-app.listen(PORT, () => {
-  console.log(`✅ AI Testigo agent (INDIVIDUAL only) radi na portu :${PORT}`);
-});
+        reply: "Trenutno ne mogu dohvatiti odgovor od AI modela. Pokušaj ponovno ili pitaj konkretnije (npr.
