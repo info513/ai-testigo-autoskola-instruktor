@@ -1,4 +1,4 @@
-// server.js  — AI Testigo (INDIVIDUAL only, strict FAQ, AI_* prompts, category summary, timeout + OpenAI Vector Store FAQ)
+// server.js  — AI Testigo (INDIVIDUAL only, strict FAQ, AI_* prompts, category summary, timeout)
 import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
@@ -12,11 +12,10 @@ const {
   OPENAI_MODEL = 'gpt-4o',
   AIRTABLE_API_KEY,
   AIRTABLE_BASE_ID_INDIVIDUAL,
-  SCHOOL_SLUG: DEFAULT_SLUG = 'instruktor',
-  OPENAI_VECTOR_STORE_FAQ_ID = '' // <-- ID vektorske baze za GLOBAL FAQ (opcionalno, preko .env)
+  SCHOOL_SLUG: DEFAULT_SLUG = 'instruktor'
 } = process.env;
 
-const promptVersion = 'v1.6.0';
+const promptVersion = 'v1.5.0';
 
 if (!OPENAI_API_KEY || !AIRTABLE_API_KEY || !AIRTABLE_BASE_ID_INDIVIDUAL) {
   console.error('❗ Nedostaju env varijable: OPENAI_API_KEY, AIRTABLE_API_KEY ili AIRTABLE_BASE_ID_INDIVIDUAL');
@@ -130,7 +129,7 @@ const TABLES = {
   lokacije: ['LOKACIJE', 'LOKACIJE & PARTNERI'],
   nastava: ['NASTAVA & PREDAVANJA'],
   upisi: ['UPIŠI SE ONLINE'],
-  faq: ['FAQ - Odgovori na pitanja', 'FAQ', 'FAQ – Odgovori', 'FAQ Odgovori'] // globalni FAQ (Airtable)
+  faq: ['FAQ - Odgovori na pitanja', 'FAQ', 'FAQ – Odgovori', 'FAQ Odgovori'] // globalni FAQ
 };
 
 /* ===== Data access ===== */
@@ -179,7 +178,7 @@ async function getAllNoSlug(nameVariants) {
   return [];
 }
 
-/* ===== Strict FAQ pretraživanje (Airtable) ===== */
+/* ===== Strict FAQ pretraživanje ===== */
 function answerFromFAQ_STRICT(userText, faqRows) {
   if (!faqRows?.length) return '';
   const qRaw = userText;
@@ -221,48 +220,6 @@ function answerFromFAQ_STRICT(userText, faqRows) {
     }
   }
   return best.ans || '';
-}
-
-/* ===== FAQ preko OpenAI Vector Store-a (GLOBAL FAQ) ===== */
-async function answerFromVectorStoreFAQ(userText) {
-  // Ako nema ID-a vektorske baze, preskačemo ovaj korak (sve radi kao prije)
-  if (!OPENAI_VECTOR_STORE_FAQ_ID) return '';
-
-  try {
-    const response = await withTimeout(
-      openai.responses.create({
-        model: 'gpt-4.1-mini', // jeftin i optimiziran za RAG
-        input: [
-          {
-            role: 'system',
-            content:
-              'Ti si AI asistent autoškole. Odgovaraj isključivo na temelju FAQ dokumenata iz priložene vektorske baze. ' +
-              'Ako ne pronađeš jasan odgovor u dokumentima, odgovori točno: "Nema odgovora u FAQ bazi."'
-          },
-          { role: 'user', content: userText }
-        ],
-        tools: [
-          {
-            type: 'file_search',
-            vector_store_ids: [OPENAI_VECTOR_STORE_FAQ_ID]
-          }
-        ],
-        max_output_tokens: 700
-      }),
-      20000
-    );
-
-    const text = (response.output_text || '').trim();
-    if (!text) return '';
-
-    // Ako je model eksplicitno rekao da nema odgovora, ne vraćamo ništa → ide dalje na Airtable / glavnu logiku
-    if (/^nema odgovora u faq bazi\.?$/i.test(text)) return '';
-
-    return text;
-  } catch (err) {
-    console.error('VECTOR_FAQ_ERROR', err?.message);
-    return '';
-  }
 }
 
 /* ===== Detektor upita o kategorijama/cijenama — da FAQ ne preuzme to ===== */
@@ -415,7 +372,7 @@ function extractFacts(userText, data, school) {
   if (t.includes('adresa') || t.includes('gdje ste') || t.includes('gdje se nalazite') || t.includes('lokacija')) {
     const adr = norm(school['Adresa']);
     const maps = norm(school['Google Maps'] || school['Maps'] || school['Geo_URL'] || school['Link na Google Maps']);
-       const hours = norm(school['Radno_vrijeme'] || school['Radno vrijeme']);
+    const hours = norm(school['Radno_vrijeme'] || school['Radno vrijeme']);
     if (adr || maps || hours) {
       return [
         'ADRESA AUTOŠKOLE:',
@@ -480,6 +437,7 @@ function buildSystemPrompt(school, data, facts, aiSections) {
   const pravila = norm(school['AI_PRAVILA'] || 'Odgovaraj isključivo prema INDIVIDUAL podacima. Ne nagađaj.');
   const uvod = norm(school['AI_POZDRAV'] || 'Bok! 👋 Kako ti mogu pomoći oko upisa, cijena ili termina?');
 
+  // ✅ FIX: maknut višak zagrade
   const tel = norm(school['Telefon'] || school['Telefon (fiksni)'] || school['Mobitel']);
   const web = norm(school['Web'] || school['Web stranica']);
   const mail = norm(school['Email'] || school['E-mail']);
@@ -604,21 +562,15 @@ app.all('/api/ask', async (req, res) => {
       else data[key] = await getBySlugMulti(variants, slug);
     }
 
-    // ❶ FAQ (STROGO iz Airtablea) — samo ako NIJE upit o kategorijama/cijenama/satima/HAK-u
+    // ❶ FAQ (STROGO) — samo ako NIJE upit o kategorijama/cijenama/satima/HAK-u
     if (!isCategoryOrPriceQuery(userMessage)) {
       const faqAnswer = answerFromFAQ_STRICT(userMessage, data.faq);
       if (faqAnswer) {
-        return res.json({ ok: true, reply: `${faqAnswer}\n\n(Odgovor iz FAQ baze – Airtable)` });
-      }
-
-      // ❷ Ako nema odgovora u tablici, pokušaj GLOBAL FAQ preko Vector Store-a (ako je konfiguriran)
-      const faqVsAnswer = await answerFromVectorStoreFAQ(userMessage);
-      if (faqVsAnswer) {
-        return res.json({ ok: true, reply: `${faqVsAnswer}\n\n(Odgovor iz FAQ vektorske baze – OpenAI Vector Store)` });
+        return res.json({ ok: true, reply: `${faqAnswer}\n\n(Odgovor iz FAQ baze)` });
       }
     }
 
-    // ❸ Heuristike + AI prompt okviri iz tablica → glavni “brain”
+    // Heuristike + AI prompt okviri iz tablica
     const facts = extractFacts(userMessage, data, safeSchool);
     const aiSections = extractAIPromptSections(data, slug);
     const systemPrompt = buildSystemPrompt(safeSchool, data, facts, aiSections);
