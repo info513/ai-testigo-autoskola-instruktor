@@ -1,4 +1,4 @@
-// server.js  — AI Testigo (INDIVIDUAL only, strict FAQ, AI_* prompts, category summary, timeout)
+// server.js — AI Testigo (INDIVIDUAL only, improved locations + instructors grouping + dodatni sat + better category parsing)
 import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
@@ -15,7 +15,6 @@ const {
   SCHOOL_SLUG: DEFAULT_SLUG = 'instruktor'
 } = process.env;
 
-// 🔄 nova verzija
 const promptVersion = 'v1.6';
 
 if (!OPENAI_API_KEY || !AIRTABLE_API_KEY || !AIRTABLE_BASE_ID_INDIVIDUAL) {
@@ -42,6 +41,9 @@ function softNorm(s = '') {
     .replace(/[^a-z0-9ćčđšž\s]/gi, ' ')
     .replace(/\s+/g, ' ')
     .trim();
+}
+function softNoDiacritics(s='') {
+  return norm(s).toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
 }
 
 function wordSet(s) {
@@ -74,37 +76,141 @@ function calcMonthlyRate(raw, months = 12) {
   return isNaN(num) ? '—' : Math.round(num / months) + ' €/mj';
 }
 
-function listVehicles(rows, wantedKat) {
+/* ==== Kategorije: robust parsing ==== */
+const KAT_CODES = ['AM','A1','A2','A','B','BE','KOD 96','C','CE','D','KOD 95','F','G'];
+function normalizeKat(value) {
+  const s = softNorm(value).toUpperCase();
+  if (!s) return '';
+  // prvo specijalni
+  if (s.includes('KOD 95') || s.includes('CODE 95')) return 'KOD 95';
+  if (s.includes('KOD 96') || s.includes('CODE 96')) return 'KOD 96';
+  if (s.includes('BE')) return 'BE';
+  // zatim standardni tokeni
+  for (const k of ['AM','A1','A2','A','B','C','CE','D','F','G']) {
+    const rx = new RegExp(`\\b${k}\\b`, 'i');
+    if (rx.test(s)) return k;
+  }
+  return '';
+}
+
+/* ==== Vehicles list ==== */
+function listVehicles(rows, wantedKat, locationHint='') {
   if (!rows?.length) return '';
+  const wanted = wantedKat ? wantedKat.toUpperCase() : '';
+  const locHint = softNorm(locationHint);
+
   const items = rows
     .filter(r => {
-      const k = norm(r['Kategorija'] || r['Namjena (kategorija)'] || r['Kategorija_ref']).toUpperCase();
-      return wantedKat ? k.includes(wantedKat) : true;
+      const katRaw = norm(r['Kategorija'] || r['Namjena (kategorija)'] || r['Kategorija_ref']);
+      const k = normalizeKat(katRaw);
+      if (wanted && k !== wanted) return false;
+
+      // optional lokacija filter (ako upit sadrži Brač/Kaštela/Trstenik/Grad)
+      if (locHint) {
+        const hay = softNorm([
+          r['Lokacija'],
+          r['LOKACIJA'],
+          r['Napomena'],
+          r['Naziv vozila'],
+          r['Model'],
+          r['Naziv']
+        ].map(norm).join(' '));
+        if (!hay.includes(locHint)) return false;
+      }
+
+      return true;
     })
     .map(r => {
-      const kat = norm(r['Kategorija'] || r['Kategorija_ref']);
+      const katRaw = norm(r['Kategorija'] || r['Kategorija_ref']);
+      const kat = normalizeKat(katRaw) || katRaw;
       const model = norm(r['Naziv vozila'] || r['Model'] || r['Naziv']);
       const tip = norm(r['Tip vozila'] || r['Tip'] || r['Vrsta vozila']);
       const god = norm(r['Godina']);
       const mjenjac = norm(r['Mjenjač'] || r['Mjenjac']);
-      return `• ${kat ? `[${kat}] ` : ''}${model || tip}${god ? ' (' + god + ')' : ''}${mjenjac ? ' – ' + mjenjac : ''}`;
+      const lok = norm(r['Lokacija'] || r['LOKACIJA']);
+      return `• ${kat ? `[${kat}] ` : ''}${model || tip}${god ? ' (' + god + ')' : ''}${mjenjac ? ' – ' + mjenjac : ''}${lok ? ' | ' + lok : ''}`;
     });
-  const list = items.slice(0, 20);
-  const extra = items.length > 20 ? `\n…i još ${items.length - 20} vozila.` : '';
+
+  const list = items.slice(0, 30);
+  const extra = items.length > 30 ? `\n…i još ${items.length - 30} vozila.` : '';
   return list.join('\n') + extra;
 }
 
-function findLocation(rows, needle) {
-  if (!rows?.length) return '';
-  const row = rows.find(l => norm(l['Tip lokacije'] || l['Tip'] || l['Vrsta']).toLowerCase().includes(needle));
+/* ==== Locations: robust find ==== */
+function locTypeOfRow(r) {
+  return softNorm(r['Tip lokacije'] || r['Tip'] || r['Vrsta'] || r['TIP'] || '');
+}
+function findBestLocation(rows, wantTypeKeywords = []) {
+  if (!rows?.length) return null;
+  const keys = (wantTypeKeywords || []).map(k => softNorm(k));
+  let best = null;
+  let bestScore = -1;
+
+  for (const r of rows) {
+    const hay = softNorm([
+      r['Tip lokacije'], r['Tip'], r['Vrsta'], r['Naziv'], r['Naziv ustanove / partnera'],
+      r['Adresa'], r['Lokacija'], r['Mjesto'], r['Grad'], r['Napomena']
+    ].map(norm).join(' '));
+
+    let score = 0;
+    for (const k of keys) {
+      if (k && hay.includes(k)) score += 2;
+    }
+    // bonus ako tip počinje s ključnom riječi
+    const t = locTypeOfRow(r);
+    for (const k of keys) {
+      if (k && t.startsWith(k)) score += 2;
+    }
+
+    if (score > bestScore) {
+      bestScore = score;
+      best = r;
+    }
+  }
+  return bestScore > 0 ? best : null;
+}
+
+function formatLocationRow(row) {
   if (!row) return '';
   const naziv = norm(row['Naziv ustanove / partnera'] || row['Naziv'] || 'Lokacija');
   const adresa = norm(row['Adresa'] || row['Lokacija']);
   const grad = norm(row['Mjesto'] || row['Grad']);
+  const tel = norm(row['Telefon'] || row['Tel'] || row['Kontakt']);
   const url = norm(row['Geo_URL'] || row['URL'] || row['Maps'] || row['Google Maps'] || row['Link na Google Maps']);
-  return `${naziv}${adresa ? ', ' + adresa : ''}${grad ? ', ' + grad : ''}${url ? ' | Mapa: ' + url : ''}`;
+  return [
+    `• ${naziv}`,
+    adresa ? `  ${adresa}${grad ? ', ' + grad : ''}` : (grad ? `  ${grad}` : ''),
+    tel ? `  T: ${tel}` : '',
+    url ? `  Mapa: ${url}` : ''
+  ].filter(Boolean).join('\n');
 }
 
+/* ==== School locations (AUTOŠKOLE): 4 lokacije u jednom polju ==== */
+function extractSchoolLocationsFromSchoolRow(school) {
+  // očekujemo da u AUTOŠKOLE imaš ili "Opis lokacije" (multiline) ili slično
+  const raw =
+    norm(school['Opis lokacije'] || school['Opis lokacija'] || school['Opis'] || school['Lokacije'] || school['Opis poslovnica']);
+  const adr = norm(school['Adresa']);
+  const maps = norm(school['Google Maps'] || school['Maps'] || school['Geo_URL'] || school['Link na Google Maps']);
+
+  const lines = raw
+    .split(/\r?\n/g)
+    .map(x => x.trim())
+    .filter(Boolean);
+
+  // ako nema multiline opisa, barem vrati osnovnu adresu
+  if (!lines.length) {
+    const base = [
+      adr ? `• ${adr}` : '',
+      maps ? `  Mapa: ${maps}` : ''
+    ].filter(Boolean).join('\n');
+    return base ? `📍 Lokacije:\n${base}` : '';
+  }
+
+  return `📍 Lokacije:\n` + lines.map(l => `• ${l}`).join('\n');
+}
+
+/* ==== Payment text ==== */
 function uvjetiText(rows) {
   if (!rows?.length) return '';
   const f = rows[0];
@@ -119,6 +225,38 @@ function uvjetiText(rows) {
   ].filter(Boolean).join(' | ');
 }
 
+/* ==== Additional hours (robust) ==== */
+function findAdditionalHoursRows(rows, kat) {
+  const K = kat?.toUpperCase();
+  if (!rows?.length || !K) return [];
+  return rows.filter(r => {
+    const k = normalizeKat(r['Kategorija'] || r['Namjena (kategorija)'] || r['Kategorija_ref'] || '');
+    if (k && k !== K) return false;
+
+    const naziv = softNorm(r['Naziv usluge'] || r['Naziv'] || r['Usluga'] || '');
+    const vrsta = softNorm(r['VRSTA FAQ'] || r['Vrsta'] || r['Tip'] || '');
+    // hvataj "dodatni sat", "dopunski sat", "sat vožnje", itd.
+    const looksLikeExtra =
+      (naziv.includes('dodatni') && naziv.includes('sat')) ||
+      (naziv.includes('dopunski') && naziv.includes('sat')) ||
+      (naziv.includes('sat') && naziv.includes('vozn')) ||
+      vrsta.includes('dodatni') ||
+      vrsta.includes('sat');
+    return looksLikeExtra;
+  });
+}
+
+/* ==== Instructors: group by location for Hajduk ==== */
+function groupInstruktoriByLokacija(rows) {
+  const groups = new Map();
+  for (const r of rows || []) {
+    const loc = norm(r['LOKACIJA'] || r['Lokacija'] || r['Poslovnica'] || '').trim() || 'Ostalo';
+    if (!groups.has(loc)) groups.set(loc, []);
+    groups.get(loc).push(r);
+  }
+  return groups;
+}
+
 /* ===== Tablice (INDIVIDUAL) ===== */
 const TABLES = {
   kategorije: ['KATEGORIJE', 'KATEGORIJE AUTOŠKOLE'],
@@ -131,7 +269,7 @@ const TABLES = {
   lokacije: ['LOKACIJE', 'LOKACIJE & PARTNERI'],
   nastava: ['NASTAVA & PREDAVANJA'],
   upisi: ['UPIŠI SE ONLINE'],
-  faq: ['FAQ - Odgovori na pitanja', 'FAQ', 'FAQ – Odgovori', 'FAQ Odgovori'] // globalni FAQ
+  faq: ['FAQ - Odgovori na pitanja', 'FAQ', 'FAQ – Odgovori', 'FAQ Odgovori']
 };
 
 /* ===== Data access ===== */
@@ -159,6 +297,7 @@ async function getBySlugMulti(nameVariants, slug) {
     try {
       const filtered = await atInd(name).select({ filterByFormula: `{Slug} = "${safeSlug}"`, maxRecords: 200 }).all();
       if (filtered?.length) return filtered.map(r => r.fields);
+
       const all = await atInd(name).select({ maxRecords: 200 }).all();
       const rows = all.map(r => r.fields).filter(f =>
         normSlug(f?.Slug || f?.['Slug (autoškola)'] || f?.['Slug (Autoškola)'] || f?.['slug (autoškola)']) === normSlug(safeSlug)
@@ -169,7 +308,6 @@ async function getBySlugMulti(nameVariants, slug) {
   return [];
 }
 
-/* get all rows without slug filter — ONLY for FAQ (univerzalna tablica) */
 async function getAllNoSlug(nameVariants) {
   for (const name of nameVariants) {
     try {
@@ -180,12 +318,11 @@ async function getAllNoSlug(nameVariants) {
   return [];
 }
 
-/* ===== Strict FAQ pretraživanje (omekšano, ali i dalje kontrolirano) ===== */
+/* ===== FAQ strict (omekšano) ===== */
 function answerFromFAQ_STRICT(userText, faqRows) {
   if (!faqRows?.length) return '';
   const q = softNorm(userText);
 
-  // prekratki/ambigusni upiti NE aktiviraju FAQ
   const wordCount = q.split(' ').filter(Boolean).length;
   if (wordCount <= 3 || q.length < 12) return '';
 
@@ -214,12 +351,8 @@ function answerFromFAQ_STRICT(userText, faqRows) {
       const { overlap, qsSize, jaccard } = overlapScore(q, cand);
       const sn = softNorm(cand);
 
-      const almostExact =
-        sn &&
-        (q.includes(sn) || sn.includes(q)) &&
-        Math.min(q.length, sn.length) >= 10;
+      const almostExact = sn && (q.includes(sn) || sn.includes(q)) && Math.min(q.length, sn.length) >= 10;
 
-      // omekšani pragovi
       const goodMatch =
         almostExact ||
         (overlap >= 3 && jaccard >= 0.4) ||
@@ -234,36 +367,41 @@ function answerFromFAQ_STRICT(userText, faqRows) {
   return best.score ? best.ans : '';
 }
 
-/* ===== Detektor upita o kategorijama/cijenama — da FAQ ne preuzme to ===== */
 function isCategoryOrPriceQuery(s) {
   const q = softNorm(s);
-  const hasKat = /\b(am|a1|a2|a|b|c|ce|d|f|g)\b/.test(q) || /kategor/.test(q);
+  const hasKat =
+    /\b(am|a1|a2|a|b|be|c|ce|d|kod\s*95|kod\s*96)\b/.test(q) ||
+    /kategor/.test(q);
+
   const hasBizWords =
-    /(cijena|cijene|koliko\s*kosta|kosta|sati|satnica|hak|naknad|paket|minimalna\s*dob|uvjeti\s*upisa|vozni\s*park|vozila|informacij|upis|teorij|praksa|voznj)/.test(q);
+    /(cijena|cijene|koliko\s*kosta|kosta|sati|satnica|hak|naknad|paket|minimalna\s*dob|uvjeti\s*upisa|vozni\s*park|vozila|informacij|upis|teorij|praksa|voznj|dodatni\s*sat|dopunski\s*sat)/.test(q);
+
   return hasKat || hasBizWords;
 }
 
-/* ===== AI prompt okviri iz tablica (AI_CONTEXT/… ) ===== */
+/* ===== AI prompt okviri iz tablica ===== */
 function extractAIPromptSections(allData, slug) {
   const sectionLines = [];
-
   const keys = Object.keys(allData).filter(k => k !== 'faq');
+
   for (const key of keys) {
     const rows = allData[key] || [];
     if (!rows.length) continue;
 
-    const row = rows.find(r =>
-      Object.keys(r).some(f => f.startsWith('AI_')) &&
-      (normSlug(r.Slug || r['Slug (autoškola)'] || r['Slug (Autoškola)'] || r['slug (autoškola)']) === normSlug(slug) || !r.Slug)
-    ) || rows.find(r => Object.keys(r).some(f => f.startsWith('AI_')));
+    const row =
+      rows.find(r =>
+        Object.keys(r).some(f => f.startsWith('AI_')) &&
+        (normSlug(r.Slug || r['Slug (autoškola)'] || r['Slug (Autoškola)'] || r['slug (autoškola)']) === normSlug(slug) || !r.Slug)
+      ) ||
+      rows.find(r => Object.keys(r).some(f => f.startsWith('AI_')));
 
     if (!row) continue;
 
-    const ctx   = norm(row.AI_CONTEXT);
-    const patt  = norm(row.AI_INTENT_PATTERNS);
+    const ctx = norm(row.AI_CONTEXT);
+    const patt = norm(row.AI_INTENT_PATTERNS);
     const rules = norm(row.AI_OUTPUT_RULES);
-    const dis   = norm(row.AI_DISAMBIGUATION);
-    const fb    = norm(row.AI_FALLBACK);
+    const dis = norm(row.AI_DISAMBIGUATION);
+    const fb = norm(row.AI_FALLBACK);
 
     const any = [ctx, patt, rules, dis, fb].some(Boolean);
     if (!any) continue;
@@ -271,11 +409,11 @@ function extractAIPromptSections(allData, slug) {
     sectionLines.push(
       [
         `=== AI INSTRUKCIJE ZA TABLICU ${key.toUpperCase()} ===`,
-        ctx   ? `Kontekst: ${ctx}` : '',
-        patt  ? `Namjere (uzorci): ${patt}` : '',
+        ctx ? `Kontekst: ${ctx}` : '',
+        patt ? `Namjere (uzorci): ${patt}` : '',
         rules ? `Pravila izlaza: ${rules}` : '',
-        dis   ? `Rasplitanje/pojašnjenje: ${dis}` : '',
-        fb    ? `Fallback kad nema podatka: ${fb}` : ''
+        dis ? `Rasplitanje/pojašnjenje: ${dis}` : '',
+        fb ? `Fallback kad nema podatka: ${fb}` : ''
       ].filter(Boolean).join('\n')
     );
   }
@@ -283,28 +421,29 @@ function extractAIPromptSections(allData, slug) {
   return sectionLines.join('\n\n');
 }
 
-/* ===== Sastavljanje kompletnog odgovora po kategoriji ===== */
+/* ===== Category summary (robust) ===== */
 function buildCategorySummary(katRaw, data) {
-  if (!katRaw) return '';
-  const kat = katRaw.toUpperCase();
+  const kat = normalizeKat(katRaw);
+  if (!kat) return '';
 
-  // 1) Sati (KATEGORIJE)
+  // 1) Sati
   let satnica = '';
-  const rowK = (data.kategorije || []).find(r => norm(r['Kategorija']).toUpperCase() === kat);
+  const rowK = (data.kategorije || []).find(r => normalizeKat(r['Kategorija'] || r['Naziv']) === kat);
   if (rowK) {
     const te = norm(rowK['Broj sati teorija'] || rowK['Broj_sati_teorija']);
-    const pr = norm(rowK['Broj sati praksa']  || rowK['Broj_sati_praksa']);
+    const pr = norm(rowK['Broj sati praksa'] || rowK['Broj_sati_praksa']);
     const trajanje = norm(rowK['Trajanje (tipično)']);
     const minDob = norm(rowK['Minimalna dob'] || rowK['Minimalna_dob']);
     const uvjetiUpisa = norm(rowK['Uvjeti upisa'] || rowK['Uvjeti_upisa']);
+
     satnica = `• Sati: Teorija ${te || '?'}h, Praksa ${pr || '?'}h${trajanje ? ` | Trajanje (tipično): ${trajanje}` : ''}`;
     if (minDob) satnica += `\n• Minimalna dob: ${minDob} godina`;
     if (uvjetiUpisa) satnica += `\n• Uvjeti upisa: ${uvjetiUpisa}`;
   }
 
-  // 2) Cijene (CJENIK)
+  // 2) Cijene
   const cj = (data.cjenik || [])
-    .filter(c => norm(c['Kategorija']).toUpperCase() === kat)
+    .filter(c => normalizeKat(c['Kategorija']) === kat)
     .map(c => {
       const varijanta = norm(c['Varijanta'] || c['Naziv'] || 'Paket');
       const cijenaRaw = norm(c['Cijena']);
@@ -317,7 +456,7 @@ function buildCategorySummary(katRaw, data) {
 
   // 3) HAK naknade
   const hak = (data.hak || [])
-    .filter(n => norm(n['Kategorija']).toUpperCase() === kat)
+    .filter(n => normalizeKat(n['Kategorija']) === kat)
     .map(n => {
       const vrsta = norm(n['Vrsta predmeta'] || n['Naziv naknade'] || n['Naziv'] || 'Naknada');
       const iznos = convertToEuro(norm(n['Iznos']));
@@ -329,113 +468,135 @@ function buildCategorySummary(katRaw, data) {
   const uvjeti = uvjetiText(data.uvjeti);
   const uvjetiSekcija = uvjeti ? `• Uvjeti plaćanja: ${uvjeti}` : '';
 
-  // 5) Dodatni sat
-  const dodatni = (data.dodatne || [])
-    .filter(d => norm(d['Naziv usluge'] || d['Naziv']).toLowerCase().includes('dodatni sat') &&
-                 norm(d['Kategorija']).toUpperCase() === kat)
-    .map(d => `  - Dodatni sat (${kat}): ${convertToEuro(norm(d['Iznos']))}`)
+  // 5) Dodatni sat (robust)
+  const extraRows = findAdditionalHoursRows(data.dodatne || [], kat);
+  const dodatni = extraRows
+    .map(d => {
+      const iznos = convertToEuro(norm(d['Iznos'] || d['Cijena']));
+      const naziv = norm(d['Naziv usluge'] || d['Naziv'] || 'Dodatni sat');
+      return `  - ${naziv}: ${iznos || '—'}`;
+    })
     .join('\n');
-  const dodatniSekcija = dodatni ? `• Dodatni sat:\n${dodatni}` : '';
+  const dodatniSekcija = dodatni ? `• Dodatni sati:\n${dodatni}` : '';
 
-  const dijelovi = [
+  return [
     `✅ KATEGORIJA ${kat}`,
     satnica,
     cjSekcija,
     hakSekcija,
     uvjetiSekcija,
     dodatniSekcija
-  ].filter(Boolean);
-
-  return dijelovi.join('\n');
+  ].filter(Boolean).join('\n');
 }
 
-/* ===== Heuristike za brze činjenice ===== */
-function extractFacts(userText, data, school) {
-  const t = norm(userText).toLowerCase();
+/* ===== Quick facts router ===== */
+function extractFacts(userText, data, school, slug) {
+  const t = softNorm(userText);
 
-  // “Daj sve info za kategoriju X …”
-  const wanted = ['am','a1','a2','a','b','c','ce','d','f','g'].find(k =>
-    t.includes(` ${k} `) || t.endsWith(` ${k}`) || t.startsWith(`${k} `) ||
-    t.includes(`kategoriju ${k}`) || t.includes(`za ${k} `)
-  );
-  if (wanted && (t.includes('sve info') || t.includes('sve informacije') || t.includes('cijene') || t.includes('sati') || t.includes('hak'))) {
-    const pack = buildCategorySummary(wanted, data);
+  // 0) "gdje poslujete / gdje ste" -> iz AUTOŠKOLE (posebno Hajduk)
+  if (
+    t.includes('gdje poslujete') ||
+    t.includes('gdje ste') ||
+    t.includes('gdje se nalazite') ||
+    t.includes('lokacije') ||
+    (t.includes('adresa') && !t.includes('hak')) ||
+    (t.includes('poslovnica'))
+  ) {
+    const schoolLocs = extractSchoolLocationsFromSchoolRow(school);
+    if (schoolLocs) return schoolLocs;
+  }
+
+  // 1) Instruktori – po lokaciji (Hajduk) ili standardno
+  if (t.includes('instruktor')) {
+    const rows = data.instruktori || [];
+    if (!rows.length) return '';
+
+    // ako pitaju benzin/dizel/vrsta motora -> izvuci NAPOMENA
+    if (t.includes('benzin') || t.includes('dizel') || t.includes('diesel') || t.includes('vrsta motora')) {
+      const lines = rows.map(r => {
+        const ime = norm(r['Ime i prezime instruktora'] || r['Ime i prezime'] || r['Instruktor']);
+        const vozilo = norm(r['Vozilo koje koristi'] || r['Vozilo']);
+        const nap = norm(r['NAPOMENA'] || r['Napomena']);
+        const lok = norm(r['LOKACIJA'] || r['Lokacija']);
+        return (ime || vozilo || nap) ? `• ${ime}${lok ? ` (${lok})` : ''}${vozilo ? ` – ${vozilo}` : ''}${nap ? ` | ${nap}` : ''}` : '';
+      }).filter(Boolean).slice(0, 80);
+
+      return lines.length ? `INSTRUKTORI (napomene o vozilu/motoru):\n${lines.join('\n')}` : '';
+    }
+
+    // Hajduk: grupiranje po lokaciji
+    if (normSlug(slug) === 'hajduk') {
+      const groups = groupInstruktoriByLokacija(rows);
+      const out = [];
+      for (const [loc, list] of groups.entries()) {
+        const lines = list.map(r => {
+          const ime = norm(r['Ime i prezime instruktora'] || r['Ime i prezime'] || r['Instruktor']);
+          const kat = norm(r['Kategorije']);
+          const vozilo = norm(r['Vozilo koje koristi'] || r['Vozilo']);
+          return `  • ${ime}${kat ? ' – ' + kat : ''}${vozilo ? ' | ' + vozilo : ''}`;
+        }).filter(Boolean);
+        if (lines.length) out.push(`📍 ${loc}\n${lines.join('\n')}`);
+      }
+      return out.length ? `INSTRUKTORI PO LOKACIJI:\n\n${out.join('\n\n')}` : '';
+    }
+
+    // ostale škole: default list
+    const lines = rows.map(r => {
+      const ime = norm(r['Ime i prezime instruktora'] || r['Ime i prezime'] || r['Instruktor']);
+      const kat = norm(r['Kategorije']);
+      const vozilo = norm(r['Vozilo koje koristi'] || r['Vozilo']);
+      return (ime || kat || vozilo) ? `• ${ime}${kat ? ' – ' + kat : ''}${vozilo ? ' | ' + vozilo : ''}` : '';
+    }).filter(Boolean).slice(0, 80);
+
+    return lines.length ? `INSTRUKTORI:\n${lines.join('\n')}` : '';
+  }
+
+  // 2) Kategorije / cijene / sati / hak — “sve info”
+  const wantedKat = normalizeKat(userText);
+  if (wantedKat && (t.includes('sve info') || t.includes('sve informacije') || t.includes('cijene') || t.includes('sati') || t.includes('hak') || t.includes('paket'))) {
+    const pack = buildCategorySummary(wantedKat, data);
     if (pack) return pack;
   }
 
-  // Minimalna dob
-  if (wanted && (t.includes('minimalna dob') || t.includes('koliko godina') || t.includes('godina'))) {
-    const row = (data.kategorije || []).find(r => norm(r['Kategorija']).toLowerCase() === wanted);
-    if (row) {
-      const md = norm(row['Minimalna dob'] || row['Minimalna_dob']);
-      if (md) return `MINIMALNA DOB ZA ${wanted.toUpperCase()}:\n• ${md} godina`;
-    }
+  // 3) HAK / prva pomoć / liječnički / poligon -> LOKACIJE tablica (robust)
+  if (t.includes('hak') || t.includes('ispitni centar')) {
+    const row = findBestLocation(data.lokacije || [], ['hak', 'ispitni', 'centar']);
+    if (row) return `HAK / ISPITNI CENTAR:\n${formatLocationRow(row)}`;
   }
 
-  // Uvjeti upisa / dokumenti
-  if (wanted && (t.includes('uvjeti upisa') || t.includes('dokument') || t.includes('što trebam ponijeti') || t.includes('sto moram ponijeti'))) {
-    const row = (data.kategorije || []).find(r => norm(r['Kategorija']).toLowerCase() === wanted);
-    if (row) {
-      const uv = norm(row['Uvjeti upisa'] || row['Uvjeti_upisa']);
-      if (uv) return `UVJETI UPISA ZA ${wanted.toUpperCase()}:\n• ${uv}`;
-    }
+  if (t.includes('prva pomoc') || t.includes('prva pomoć')) {
+    const row = findBestLocation(data.lokacije || [], ['prva pomoc', 'prva pomoć', 'crveni kriz', 'crveni križ']);
+    if (row) return `PRVA POMOĆ:\n${formatLocationRow(row)}`;
   }
 
-  if (t.includes('adresa') || t.includes('gdje ste') || t.includes('gdje se nalazite') || t.includes('lokacija')) {
-    const adr = norm(school['Adresa']);
-    const maps = norm(school['Google Maps'] || school['Maps'] || school['Geo_URL'] || school['Link na Google Maps']);
-    const hours = norm(school['Radno_vrijeme'] || school['Radno vrijeme']);
-    if (adr || maps || hours) {
-      return [
-        'ADRESA AUTOŠKOLE:',
-        adr ? `• ${adr}` : '',
-        maps ? `• Mapa: ${maps}` : '',
-        hours ? `• Radno vrijeme: ${hours}` : ''
-      ].filter(Boolean).join('\n');
-    }
-    const alt = findLocation(data.lokacije, 'auto') || findLocation(data.lokacije, 'ured');
-    if (alt) return `ADRESA AUTOŠKOLE:\n• ${alt}`;
+  if (t.includes('lijecnick') || t.includes('liječnič') || t.includes('medicina rada') || t.includes('pregled')) {
+    const row = findBestLocation(data.lokacije || [], ['medicina rada', 'lijecnick', 'liječnič', 'pregled']);
+    if (row) return `LIJEČNIČKI PREGLED:\n${formatLocationRow(row)}`;
   }
 
-  if (t.includes('poligon') || t.includes('vježbalište')) {
-    const pol = findLocation(data.lokacije, 'poligon');
-    if (pol) return `POLIGON:\n• ${pol}`;
+  if (t.includes('poligon') || t.includes('vjezbali') || t.includes('vježbali')) {
+    const row = findBestLocation(data.lokacije || [], ['poligon', 'vježbali', 'vjezbali']);
+    if (row) return `POLIGON:\n${formatLocationRow(row)}`;
   }
 
-  if (t.includes('prva pomoć')) {
-    const pp = findLocation(data.lokacije, 'prva pomoć');
-    if (pp) return `PRVA POMOĆ:\n• ${pp}`;
-  }
-
-  if (t.includes('liječnič') || t.includes('lijecnick') || t.includes('medicina rada') || t.includes('pregled')) {
-    const med = findLocation(data.lokacije, 'medicina rada');
-    if (med) return `MEDICINA RADA – Liječnički pregled:\n• ${med}`;
-  }
-
-  if (t.includes('kartic') || t.includes('rate') || t.includes('plaćan')) {
+  // 4) Uvjeti plaćanja
+  if (t.includes('kartic') || t.includes('kartic') || t.includes('rate') || t.includes('plaćan') || t.includes('placan')) {
     const u = uvjetiText(data.uvjeti);
     if (u) return `UVJETI PLAĆANJA:\n${u}`;
   }
 
+  // 5) Vozni park + lokacijski hint (brač/kaštela/trstenik/grad)
   if (t.includes('vozni park') || t.includes('vozila')) {
-    let kat = '';
-    for (const k of ['am','a1','a2','a','b','c','ce','d','f','g']) {
-      if (t.includes(` ${k} `) || t.endsWith(` ${k}`) || t.startsWith(`${k} `)) { kat = k.toUpperCase(); break; }
-    }
-    const list = listVehicles(data.vozni, kat);
-    if (list) return `VOZNI PARK${kat ? ` – Kategorija ${kat}` : ''}:\n${list}`;
-  }
+    const locHint =
+      t.includes('brac') || t.includes('brač') ? 'brač' :
+      t.includes('supetar') ? 'supetar' :
+      t.includes('kaštel') || t.includes('kastel') ? 'kaštel' :
+      t.includes('trstenik') ? 'trstenik' :
+      t.includes('grad') ? 'grad' : '';
 
-  if (t.includes('koliko sati') || t.includes('satnica') || t.includes('teorija') || t.includes('praksa')) {
-    const kat = ['am','a1','a2','a','b','c','ce','d','f','g'].find(k =>
-      t.includes(` ${k} `) || t.endsWith(` ${k}`) || t.startsWith(`${k} `) || t.includes(`${k} kategor`)
-    );
-    if (kat && Array.isArray(data.kategorije)) {
-      const row = data.kategorije.find(k => norm(k['Kategorija']).toLowerCase() === kat);
-      if (row) {
-        return `SATNICA ZA ${kat.toUpperCase()}:\n• Teorija: ${row['Broj sati teorija'] || row['Broj_sati_teorija']}h\n• Praksa: ${row['Broj sati praksa'] || row['Broj_sati_praksa']}h`;
-      }
-    }
+    const wanted = wantedKat || '';
+    const list = listVehicles(data.vozni || [], wanted, locHint);
+    if (list) return `VOZNI PARK${wanted ? ` – Kategorija ${wanted}` : ''}${locHint ? ` (${locHint})` : ''}:\n${list}`;
   }
 
   return '';
@@ -454,7 +615,7 @@ function buildSystemPrompt(school, data, facts, aiSections) {
   const mail = norm(school['Email'] || school['E-mail']);
 
   const kategorije = (data.kategorije || []).map(k => {
-    const naziv = norm(k['Kategorija'] || k['Naziv']);
+    const naziv = normalizeKat(k['Kategorija'] || k['Naziv']) || norm(k['Kategorija'] || k['Naziv']);
     const teorija = norm(k['Broj sati teorija'] || k['Broj_sati_teorija']);
     const praksa  = norm(k['Broj sati praksa']  || k['Broj_sati_praksa']);
     return `• ${naziv}: Teorija ${teorija}h | Praksa ${praksa}h`;
@@ -462,7 +623,7 @@ function buildSystemPrompt(school, data, facts, aiSections) {
 
   const cjenik = (data.cjenik || []).map(c => {
     const naziv = norm(c['Varijanta'] || c['Naziv']);
-    const kat = norm(c['Kategorija']);
+    const kat = normalizeKat(c['Kategorija']) || norm(c['Kategorija']);
     const cijenaRaw = norm(c['Cijena']);
     const cijena = convertToEuro(cijenaRaw);
     const mjRata = calcMonthlyRate(cijenaRaw);
@@ -479,7 +640,7 @@ function buildSystemPrompt(school, data, facts, aiSections) {
 
   const dodatne = (data.dodatne || []).map(d => {
     const name = norm(d['Naziv usluge'] || d['Naziv']);
-    const kat = norm(d['Kategorija']);
+    const kat = normalizeKat(d['Kategorija']) || norm(d['Kategorija']);
     const cijena = convertToEuro(norm(d['Iznos'] || d['Cijena']));
     return (name || kat || cijena) ? `• ${name}${kat ? ` (${kat})` : ''}${cijena ? ` – ${cijena}` : ''}` : '';
   }).filter(Boolean).join('\n');
@@ -488,11 +649,13 @@ function buildSystemPrompt(school, data, facts, aiSections) {
     const ime = norm(i['Ime i prezime instruktora'] || i['Ime i prezime'] || i['Instruktor']);
     const kat = norm(i['Kategorije']);
     const vozilo = norm(i['Vozilo koje koristi']);
-    return (ime || kat || vozilo) ? `• ${ime}${kat ? ' – ' + kat : ''}${vozilo ? ' | ' + vozilo : ''}` : '';
+    const lok = norm(i['LOKACIJA'] || i['Lokacija']);
+    return (ime || kat || vozilo) ? `• ${ime}${lok ? ` (${lok})` : ''}${kat ? ' – ' + kat : ''}${vozilo ? ' | ' + vozilo : ''}` : '';
   }).filter(Boolean).join('\n');
 
-  const vozniPark = listVehicles(data.vozni, '');
-  const poligon = findLocation(data.lokacije, 'poligon');
+  const vozniPark = listVehicles(data.vozni || [], '', '');
+  const poligonRow = findBestLocation(data.lokacije || [], ['poligon', 'vježbali', 'vjezbali']);
+  const poligon = poligonRow ? formatLocationRow(poligonRow) : '';
 
   return `
 Ti si AI asistent autoškole.
@@ -500,7 +663,7 @@ Ti si AI asistent autoškole.
 **Politika odgovaranja (SAMO INDIVIDUAL BAZA):**
 1) Koristi isključivo INDIVIDUAL podatke (tablice + činjenice). Ne koristi vanjske izvore.
 2) Ako podatak ne postoji, reci iskreno da nemaš informaciju i ponudi kontakt. Ne pretpostavljaj i ne izmišljaj.
-3) Za cijene i sate: primarni izvor je CJENIK + KATEGORIJE; HAK naknade iz tablice PLAĆANJE HAK-u; dodatni sat iz DODATNE USLUGE.
+3) Za cijene i sate: primarni izvor je CJENIK + KATEGORIJE; HAK naknade iz tablice PLAĆANJE HAK-u; dodatni sati iz DODATNE USLUGE.
 4) Poštuj niže AI okvire (AI_CONTEXT/INTENT_PATTERNS/OUTPUT_RULES/DISAMBIGUATION/FALLBACK) za svaku tablicu.
 
 Osobnost: ${persona}
@@ -539,6 +702,9 @@ ${vozniPark || '(nema podataka)'}
 ${poligon || '(nema podataka)'}
 
 Otvarajući pozdrav: ${uvod}
+
+Važno:
+- Kad korisnik pita "gdje ste / gdje poslujete / lokacije", koristi AUTOŠKOLE -> "Opis lokacije" i ne spominji ništa o Prvoj pomoći osim ako je izričito pita.
 `.trim();
 }
 
@@ -573,19 +739,21 @@ app.all('/api/ask', async (req, res) => {
       else data[key] = await getBySlugMulti(variants, slug);
     }
 
-    // ❶ FAQ (STROGO, ali omekšano) — samo ako NIJE upit o kategorijama/cijenama/satima/HAK-u
+    // ❶ FAQ (omekšano) — samo ako NIJE upit o kategorijama/cijenama/HAK/vozila...
     if (!isCategoryOrPriceQuery(userMessage)) {
       const faqAnswer = answerFromFAQ_STRICT(userMessage, data.faq);
-      if (faqAnswer) {
-        // 🔕 više ne spominjemo Airtable
-        return res.json({ ok: true, reply: faqAnswer });
-      }
+      if (faqAnswer) return res.json({ ok: true, reply: faqAnswer });
     }
 
-    // Heuristike + AI prompt okviri iz tablica
-    const facts = extractFacts(userMessage, data, safeSchool);
+    // ❷ Heuristike (lokacije, instruktori, kategorije paketi…)
+    const facts = extractFacts(userMessage, data, safeSchool, slug);
+    if (facts) {
+      return res.json({ ok: true, reply: `${facts}\n\n(v ${promptVersion})` });
+    }
+
+    // ❸ AI odgovor
     const aiSections = extractAIPromptSections(data, slug);
-    const systemPrompt = buildSystemPrompt(safeSchool, data, facts, aiSections);
+    const systemPrompt = buildSystemPrompt(safeSchool, data, '', aiSections);
 
     const messages = [
       { role: 'system', content: systemPrompt },
@@ -609,15 +777,15 @@ app.all('/api/ask', async (req, res) => {
       console.error('OPENAI_CALL_ERROR', err?.message);
       return res.json({
         ok: true,
-        reply: "Trenutno ne mogu dohvatiti odgovor od AI modela. Pokušaj ponovno ili pitaj konkretnije (npr. 'Cijene i sati za A kategoriju')."
+        reply: `Trenutno ne mogu dohvatiti odgovor. Pokušaj ponovno ili pitaj konkretnije.\n\n(v ${promptVersion})`
       });
     }
 
     if (!reply || reply === '...') {
-      return res.json({ ok: true, reply: "Nažalost, nisam uspio generirati odgovor. Pokušaj ponovno konkretnije." });
+      return res.json({ ok: true, reply: `Nažalost, nisam uspio generirati odgovor. Pokušaj ponovno konkretnije.\n\n(v ${promptVersion})` });
     }
 
-    res.json({ ok: true, reply: `${reply}\n\n(Ovaj odgovor koristi prompt verziju ${promptVersion})` });
+    res.json({ ok: true, reply: `${reply}\n\n(v ${promptVersion})` });
   } catch (e) {
     console.error('API_ERROR', e.message);
     res.status(500).json({ ok: false, error: e.message });
