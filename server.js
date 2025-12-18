@@ -6,16 +6,26 @@ import Airtable from 'airtable';
 import OpenAI from 'openai';
 import { setTimeout as delay } from 'timers/promises';
 
+// ✅ dodatno (Vector Store sync)
+import fs from 'fs';
+import os from 'os';
+import path from 'path';
+import crypto from 'crypto';
+
 const {
   PORT = 8080,
   OPENAI_API_KEY,
   OPENAI_MODEL = 'gpt-4o',
   AIRTABLE_API_KEY,
   AIRTABLE_BASE_ID_INDIVIDUAL,
-  SCHOOL_SLUG: DEFAULT_SLUG = 'instruktor'
+  SCHOOL_SLUG: DEFAULT_SLUG = 'instruktor',
+
+  // ✅ Vector Store
+  VECTOR_STORE_ID,
+  VECTOR_SYNC_SECRET = ''
 } = process.env;
 
-const promptVersion = 'v1.6';
+const promptVersion = 'v1.7';
 
 if (!OPENAI_API_KEY || !AIRTABLE_API_KEY || !AIRTABLE_BASE_ID_INDIVIDUAL) {
   console.error('❗ Nedostaju env varijable: OPENAI_API_KEY, AIRTABLE_API_KEY ili AIRTABLE_BASE_ID_INDIVIDUAL');
@@ -81,11 +91,9 @@ const KAT_CODES = ['AM','A1','A2','A','B','BE','KOD 96','C','CE','D','KOD 95','F
 function normalizeKat(value) {
   const s = softNorm(value).toUpperCase();
   if (!s) return '';
-  // prvo specijalni
   if (s.includes('KOD 95') || s.includes('CODE 95')) return 'KOD 95';
   if (s.includes('KOD 96') || s.includes('CODE 96')) return 'KOD 96';
   if (s.includes('BE')) return 'BE';
-  // zatim standardni tokeni
   for (const k of ['AM','A1','A2','A','B','C','CE','D','F','G']) {
     const rx = new RegExp(`\\b${k}\\b`, 'i');
     if (rx.test(s)) return k;
@@ -105,7 +113,6 @@ function listVehicles(rows, wantedKat, locationHint='') {
       const k = normalizeKat(katRaw);
       if (wanted && k !== wanted) return false;
 
-      // optional lokacija filter (ako upit sadrži Brač/Kaštela/Trstenik/Grad)
       if (locHint) {
         const hay = softNorm([
           r['Lokacija'],
@@ -156,7 +163,6 @@ function findBestLocation(rows, wantTypeKeywords = []) {
     for (const k of keys) {
       if (k && hay.includes(k)) score += 2;
     }
-    // bonus ako tip počinje s ključnom riječi
     const t = locTypeOfRow(r);
     for (const k of keys) {
       if (k && t.startsWith(k)) score += 2;
@@ -187,7 +193,6 @@ function formatLocationRow(row) {
 
 /* ==== School locations (AUTOŠKOLE): 4 lokacije u jednom polju ==== */
 function extractSchoolLocationsFromSchoolRow(school) {
-  // očekujemo da u AUTOŠKOLE imaš ili "Opis lokacije" (multiline) ili slično
   const raw =
     norm(school['Opis lokacije'] || school['Opis lokacija'] || school['Opis'] || school['Lokacije'] || school['Opis poslovnica']);
   const adr = norm(school['Adresa']);
@@ -198,7 +203,6 @@ function extractSchoolLocationsFromSchoolRow(school) {
     .map(x => x.trim())
     .filter(Boolean);
 
-  // ako nema multiline opisa, barem vrati osnovnu adresu
   if (!lines.length) {
     const base = [
       adr ? `• ${adr}` : '',
@@ -235,7 +239,6 @@ function findAdditionalHoursRows(rows, kat) {
 
     const naziv = softNorm(r['Naziv usluge'] || r['Naziv'] || r['Usluga'] || '');
     const vrsta = softNorm(r['VRSTA FAQ'] || r['Vrsta'] || r['Tip'] || '');
-    // hvataj "dodatni sat", "dopunski sat", "sat vožnje", itd.
     const looksLikeExtra =
       (naziv.includes('dodatni') && naziv.includes('sat')) ||
       (naziv.includes('dopunski') && naziv.includes('sat')) ||
@@ -426,7 +429,6 @@ function buildCategorySummary(katRaw, data) {
   const kat = normalizeKat(katRaw);
   if (!kat) return '';
 
-  // 1) Sati
   let satnica = '';
   const rowK = (data.kategorije || []).find(r => normalizeKat(r['Kategorija'] || r['Naziv']) === kat);
   if (rowK) {
@@ -441,7 +443,6 @@ function buildCategorySummary(katRaw, data) {
     if (uvjetiUpisa) satnica += `\n• Uvjeti upisa: ${uvjetiUpisa}`;
   }
 
-  // 2) Cijene
   const cj = (data.cjenik || [])
     .filter(c => normalizeKat(c['Kategorija']) === kat)
     .map(c => {
@@ -454,7 +455,6 @@ function buildCategorySummary(katRaw, data) {
     }).join('\n');
   const cjSekcija = cj ? `• Cijene:\n${cj}` : '';
 
-  // 3) HAK naknade
   const hak = (data.hak || [])
     .filter(n => normalizeKat(n['Kategorija']) === kat)
     .map(n => {
@@ -464,11 +464,9 @@ function buildCategorySummary(katRaw, data) {
     }).join('\n');
   const hakSekcija = hak ? `• Ispitne naknade (HAK):\n${hak}` : '';
 
-  // 4) Uvjeti plaćanja
   const uvjeti = uvjetiText(data.uvjeti);
   const uvjetiSekcija = uvjeti ? `• Uvjeti plaćanja: ${uvjeti}` : '';
 
-  // 5) Dodatni sat (robust)
   const extraRows = findAdditionalHoursRows(data.dodatne || [], kat);
   const dodatni = extraRows
     .map(d => {
@@ -493,7 +491,6 @@ function buildCategorySummary(katRaw, data) {
 function extractFacts(userText, data, school, slug) {
   const t = softNorm(userText);
 
-  // 0) "gdje poslujete / gdje ste" -> iz AUTOŠKOLE (posebno Hajduk)
   if (
     t.includes('gdje poslujete') ||
     t.includes('gdje ste') ||
@@ -506,12 +503,10 @@ function extractFacts(userText, data, school, slug) {
     if (schoolLocs) return schoolLocs;
   }
 
-  // 1) Instruktori – po lokaciji (Hajduk) ili standardno
   if (t.includes('instruktor')) {
     const rows = data.instruktori || [];
     if (!rows.length) return '';
 
-    // ako pitaju benzin/dizel/vrsta motora -> izvuci NAPOMENA
     if (t.includes('benzin') || t.includes('dizel') || t.includes('diesel') || t.includes('vrsta motora')) {
       const lines = rows.map(r => {
         const ime = norm(r['Ime i prezime instruktora'] || r['Ime i prezime'] || r['Instruktor']);
@@ -524,7 +519,6 @@ function extractFacts(userText, data, school, slug) {
       return lines.length ? `INSTRUKTORI (napomene o vozilu/motoru):\n${lines.join('\n')}` : '';
     }
 
-    // Hajduk: grupiranje po lokaciji
     if (normSlug(slug) === 'hajduk') {
       const groups = groupInstruktoriByLokacija(rows);
       const out = [];
@@ -540,7 +534,6 @@ function extractFacts(userText, data, school, slug) {
       return out.length ? `INSTRUKTORI PO LOKACIJI:\n\n${out.join('\n\n')}` : '';
     }
 
-    // ostale škole: default list
     const lines = rows.map(r => {
       const ime = norm(r['Ime i prezime instruktora'] || r['Ime i prezime'] || r['Instruktor']);
       const kat = norm(r['Kategorije']);
@@ -551,14 +544,12 @@ function extractFacts(userText, data, school, slug) {
     return lines.length ? `INSTRUKTORI:\n${lines.join('\n')}` : '';
   }
 
-  // 2) Kategorije / cijene / sati / hak — “sve info”
   const wantedKat = normalizeKat(userText);
   if (wantedKat && (t.includes('sve info') || t.includes('sve informacije') || t.includes('cijene') || t.includes('sati') || t.includes('hak') || t.includes('paket'))) {
     const pack = buildCategorySummary(wantedKat, data);
     if (pack) return pack;
   }
 
-  // 3) HAK / prva pomoć / liječnički / poligon -> LOKACIJE tablica (robust)
   if (t.includes('hak') || t.includes('ispitni centar')) {
     const row = findBestLocation(data.lokacije || [], ['hak', 'ispitni', 'centar']);
     if (row) return `HAK / ISPITNI CENTAR:\n${formatLocationRow(row)}`;
@@ -579,13 +570,11 @@ function extractFacts(userText, data, school, slug) {
     if (row) return `POLIGON:\n${formatLocationRow(row)}`;
   }
 
-  // 4) Uvjeti plaćanja
-  if (t.includes('kartic') || t.includes('kartic') || t.includes('rate') || t.includes('plaćan') || t.includes('placan')) {
+  if (t.includes('kartic') || t.includes('rate') || t.includes('plaćan') || t.includes('placan')) {
     const u = uvjetiText(data.uvjeti);
     if (u) return `UVJETI PLAĆANJA:\n${u}`;
   }
 
-  // 5) Vozni park + lokacijski hint (brač/kaštela/trstenik/grad)
   if (t.includes('vozni park') || t.includes('vozila')) {
     const locHint =
       t.includes('brac') || t.includes('brač') ? 'brač' :
@@ -714,6 +703,109 @@ async function withTimeout(promise, ms = 20000) {
   return Promise.race([promise, timeout]);
 }
 
+/* =========================================================
+   ✅ VECTOR STORE: build FAQ TXT + sync + search
+========================================================= */
+
+let lastFaqHash = '';
+let lastSyncAt = 0;
+
+function buildFaqTextFile(faqRows, slug) {
+  const active = (faqRows || []).filter(r => String(r['AKTIVNO'] ?? r['Aktivno'] ?? true) !== 'false');
+
+  const blocks = active.map((r, idx) => {
+    const vs = norm(r['VS_DOC'] || r['Vs_doc'] || r['VS doc'] || '');
+    if (vs) return `### FAQ ${idx + 1}\n${vs}`.trim();
+
+    const pitanja = norm(r['PITANJA'] || r['Pitanja'] || r['Pitanje'] || '');
+    const odgovor = norm(r['ODGOVORI'] || r['Odgovor'] || r['Odgovori'] || '');
+    if (!pitanja && !odgovor) return '';
+
+    return [
+      `### FAQ ${idx + 1}`,
+      pitanja ? `PITANJA:\n${pitanja}` : '',
+      odgovor ? `ODGOVOR:\n${odgovor}` : ''
+    ].filter(Boolean).join('\n\n');
+  }).filter(Boolean);
+
+  const header = `AI Testigo FAQ Export\nSlug: ${slug}\nVrijeme: ${new Date().toISOString()}\n`;
+  const text = header + '\n' + blocks.join('\n\n---\n\n');
+
+  const hash = crypto.createHash('sha256').update(text).digest('hex');
+  return { text, hash };
+}
+
+async function clearVectorStoreFiles(vectorStoreId) {
+  const list = await openai.vectorStores.files.list(vectorStoreId);
+  const items = list?.data || [];
+  for (const it of items) {
+    try { await openai.vectorStores.files.del(vectorStoreId, it.id); } catch {}
+  }
+}
+
+async function syncFaqToVectorStoreIfNeeded(faqRows, slug, force = false) {
+  if (!VECTOR_STORE_ID) return { ok: false, reason: 'VECTOR_STORE_ID not set' };
+
+  const { text, hash } = buildFaqTextFile(faqRows, slug);
+
+  const now = Date.now();
+  const tooSoon = (now - lastSyncAt) < 60_000; // 1 min zaštita
+  if (!force && (hash === lastFaqHash || tooSoon)) {
+    return { ok: true, skipped: true, hash };
+  }
+
+  const tmpDir = os.tmpdir();
+  const filePath = path.join(tmpDir, `faq_${slug}_${Date.now()}.txt`);
+  fs.writeFileSync(filePath, text, 'utf8');
+
+  const uploaded = await openai.files.create({
+    file: fs.createReadStream(filePath),
+    purpose: 'assistants'
+  });
+
+  await clearVectorStoreFiles(VECTOR_STORE_ID);
+  await openai.vectorStores.files.create(VECTOR_STORE_ID, { file_id: uploaded.id });
+
+  lastFaqHash = hash;
+  lastSyncAt = now;
+
+  try { fs.unlinkSync(filePath); } catch {}
+
+  console.log(`✅ VectorStore sync OK | slug=${slug} | hash=${hash} | file_id=${uploaded.id}`);
+  return { ok: true, skipped: false, hash, file_id: uploaded.id };
+}
+
+async function vectorStoreSearch(query) {
+  if (!VECTOR_STORE_ID) return '';
+  const q = norm(query).trim();
+  if (!q) return '';
+
+  try {
+    const result = await openai.vectorStores.search(VECTOR_STORE_ID, {
+      query: q,
+      max_num_results: 5
+    });
+
+    const hits = result?.data || [];
+    if (!hits.length) return '';
+
+    const chunks = hits.map((h, i) => {
+      const content = (h?.content || [])
+        .map(c => c?.text || '')
+        .filter(Boolean)
+        .join('\n')
+        .trim();
+
+      return content ? `#${i + 1}\n${content}` : '';
+    }).filter(Boolean);
+
+    return chunks.length ? `=== VECTOR STORE REZULTATI (FAQ) ===\n${chunks.join('\n\n')}` : '';
+  } catch (e) {
+    console.warn('VECTOR_SEARCH_WARN', e?.message);
+    return '';
+  }
+}
+
 /* ===== API ===== */
 app.all('/api/ask', async (req, res) => {
   res.setHeader('Content-Type', 'application/json; charset=utf-8');
@@ -739,24 +831,27 @@ app.all('/api/ask', async (req, res) => {
       else data[key] = await getBySlugMulti(variants, slug);
     }
 
-    // ❶ FAQ (omekšano) — samo ako NIJE upit o kategorijama/cijenama/HAK/vozila...
+    // ✅ (A) FAQ strict — prvo (brzo i jeftino)
     if (!isCategoryOrPriceQuery(userMessage)) {
       const faqAnswer = answerFromFAQ_STRICT(userMessage, data.faq);
       if (faqAnswer) return res.json({ ok: true, reply: faqAnswer });
     }
 
-    // ❷ Heuristike (lokacije, instruktori, kategorije paketi…)
+    // ✅ (B) Heuristike
     const facts = extractFacts(userMessage, data, safeSchool, slug);
     if (facts) {
       return res.json({ ok: true, reply: `${facts}\n\n(v ${promptVersion})` });
     }
 
-    // ❸ AI odgovor
+    // ✅ (C) AI + Vector Store fallback kontekst
     const aiSections = extractAIPromptSections(data, slug);
     const systemPrompt = buildSystemPrompt(safeSchool, data, '', aiSections);
 
+    const vs = await vectorStoreSearch(userMessage);
+
     const messages = [
       { role: 'system', content: systemPrompt },
+      ...(vs ? [{ role: 'system', content: vs }] : []),
       ...history.map(h => ({ role: h.role, content: h.content })),
       { role: 'user', content: userMessage }
     ];
@@ -792,6 +887,25 @@ app.all('/api/ask', async (req, res) => {
   }
 });
 
+/* ===== Admin: ručni sync FAQ -> Vector Store ===== */
+app.post('/api/admin/sync-faq', async (req, res) => {
+  try {
+    const token = norm(req.headers['x-sync-token'] || req.query.token || req.body?.token);
+    if (VECTOR_SYNC_SECRET && token !== VECTOR_SYNC_SECRET) {
+      return res.status(401).json({ ok: false, error: 'Unauthorized' });
+    }
+
+    const slug = normSlug(req.query.slug || DEFAULT_SLUG);
+    const faqRows = await getAllNoSlug(TABLES.faq);
+
+    const out = await syncFaqToVectorStoreIfNeeded(faqRows, slug, true);
+    res.json({ ok: true, ...out });
+  } catch (e) {
+    console.error('SYNC_FAQ_ERROR', e?.message);
+    res.status(500).json({ ok: false, error: e?.message });
+  }
+});
+
 /* ===== Debug & Health ===== */
 app.get('/api/debug', async (req, res) => {
   const slug = normSlug(req.query.slug || DEFAULT_SLUG);
@@ -813,3 +927,28 @@ app.get('/api/health', (req, res) => {
 app.listen(PORT, () => {
   console.log(`✅ AI Testigo agent (INDIVIDUAL only) radi na portu :${PORT}`);
 });
+
+/* ===== Boot Vector Sync (start + svakih 6h) ===== */
+async function bootVectorSync() {
+  if (!VECTOR_STORE_ID) {
+    console.log('ℹ️ VECTOR_STORE_ID nije postavljen — preskačem Vector Store sync.');
+    return;
+  }
+  try {
+    const faqRows = await getAllNoSlug(TABLES.faq);
+    await syncFaqToVectorStoreIfNeeded(faqRows, DEFAULT_SLUG, false);
+  } catch (e) {
+    console.warn('VECTOR_SYNC_BOOT_WARN', e?.message);
+  }
+
+  setInterval(async () => {
+    try {
+      const faqRows = await getAllNoSlug(TABLES.faq);
+      await syncFaqToVectorStoreIfNeeded(faqRows, DEFAULT_SLUG, false);
+    } catch (e) {
+      console.warn('VECTOR_SYNC_INTERVAL_WARN', e?.message);
+    }
+  }, 6 * 60 * 60 * 1000);
+}
+
+bootVectorSync();
