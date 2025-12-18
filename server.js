@@ -1,4 +1,4 @@
-// server.js — AI Testigo (INDIVIDUAL only, improved locations + instructors grouping + dodatni sat + better category parsing)
+// server.js — AI Testigo (INDIVIDUAL only + Vector Store FAQ sync restricted to {slug}+global)
 import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
@@ -6,7 +6,7 @@ import Airtable from 'airtable';
 import OpenAI from 'openai';
 import { setTimeout as delay } from 'timers/promises';
 
-// ✅ dodatno (Vector Store sync)
+// ✅ Vector Store sync
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
@@ -25,7 +25,7 @@ const {
   VECTOR_SYNC_SECRET = ''
 } = process.env;
 
-const promptVersion = 'v1.7';
+const promptVersion = 'v1.8';
 
 if (!OPENAI_API_KEY || !AIRTABLE_API_KEY || !AIRTABLE_BASE_ID_INDIVIDUAL) {
   console.error('❗ Nedostaju env varijable: OPENAI_API_KEY, AIRTABLE_API_KEY ili AIRTABLE_BASE_ID_INDIVIDUAL');
@@ -51,9 +51,6 @@ function softNorm(s = '') {
     .replace(/[^a-z0-9ćčđšž\s]/gi, ' ')
     .replace(/\s+/g, ' ')
     .trim();
-}
-function softNoDiacritics(s='') {
-  return norm(s).toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
 }
 
 function wordSet(s) {
@@ -160,13 +157,10 @@ function findBestLocation(rows, wantTypeKeywords = []) {
     ].map(norm).join(' '));
 
     let score = 0;
-    for (const k of keys) {
-      if (k && hay.includes(k)) score += 2;
-    }
+    for (const k of keys) if (k && hay.includes(k)) score += 2;
+
     const t = locTypeOfRow(r);
-    for (const k of keys) {
-      if (k && t.startsWith(k)) score += 2;
-    }
+    for (const k of keys) if (k && t.startsWith(k)) score += 2;
 
     if (score > bestScore) {
       bestScore = score;
@@ -198,10 +192,7 @@ function extractSchoolLocationsFromSchoolRow(school) {
   const adr = norm(school['Adresa']);
   const maps = norm(school['Google Maps'] || school['Maps'] || school['Geo_URL'] || school['Link na Google Maps']);
 
-  const lines = raw
-    .split(/\r?\n/g)
-    .map(x => x.trim())
-    .filter(Boolean);
+  const lines = raw.split(/\r?\n/g).map(x => x.trim()).filter(Boolean);
 
   if (!lines.length) {
     const base = [
@@ -305,19 +296,28 @@ async function getBySlugMulti(nameVariants, slug) {
       const rows = all.map(r => r.fields).filter(f =>
         normSlug(f?.Slug || f?.['Slug (autoškola)'] || f?.['Slug (Autoškola)'] || f?.['slug (autoškola)']) === normSlug(safeSlug)
       );
-      return rows.length ? rows : all.map(r => r.fields);
+      // ⚠️ NAMJERNO: ako nema slug redova, vraćamo prazno (ne "sve") da se ne miješaju škole
+      return rows.length ? rows : [];
     } catch {}
   }
   return [];
 }
 
-async function getAllNoSlug(nameVariants) {
-  for (const name of nameVariants) {
+/* ✅ FAQ: dohvat samo (slug + global) — NEMA "sve" */
+async function getFaqBySlugOrGlobal(slug) {
+  const safe = sanitizeForFormula(slug || DEFAULT_SLUG);
+
+  for (const name of TABLES.faq) {
     try {
-      const all = await atInd(name).select({ maxRecords: 500 }).all();
-      if (all?.length) return all.map(r => r.fields);
+      const recs = await atInd(name).select({
+        filterByFormula: `OR({Slug} = "${safe}", {Slug} = "global")`,
+        maxRecords: 500
+      }).all();
+      if (recs?.length) return recs.map(r => r.fields);
+      return []; // ako tablica postoji ali nema redova
     } catch {}
   }
+
   return [];
 }
 
@@ -705,6 +705,7 @@ async function withTimeout(promise, ms = 20000) {
 
 /* =========================================================
    ✅ VECTOR STORE: build FAQ TXT + sync + search
+   ✅ Sadržaj je strogo: (slug + global)
 ========================================================= */
 
 let lastFaqHash = '';
@@ -721,14 +722,17 @@ function buildFaqTextFile(faqRows, slug) {
     const odgovor = norm(r['ODGOVORI'] || r['Odgovor'] || r['Odgovori'] || '');
     if (!pitanja && !odgovor) return '';
 
+    // ⬇️ ubacimo i slug u tekst (pomaže debug-u + kontekstu)
+    const rowSlug = norm(r['Slug'] || '').trim();
     return [
       `### FAQ ${idx + 1}`,
+      rowSlug ? `SLUG: ${rowSlug}` : '',
       pitanja ? `PITANJA:\n${pitanja}` : '',
       odgovor ? `ODGOVOR:\n${odgovor}` : ''
     ].filter(Boolean).join('\n\n');
   }).filter(Boolean);
 
-  const header = `AI Testigo FAQ Export\nSlug: ${slug}\nVrijeme: ${new Date().toISOString()}\n`;
+  const header = `AI Testigo FAQ Export\nScope: slug="${slug}" + "global"\nVrijeme: ${new Date().toISOString()}\n`;
   const text = header + '\n' + blocks.join('\n\n---\n\n');
 
   const hash = crypto.createHash('sha256').update(text).digest('hex');
@@ -755,7 +759,7 @@ async function syncFaqToVectorStoreIfNeeded(faqRows, slug, force = false) {
   }
 
   const tmpDir = os.tmpdir();
-  const filePath = path.join(tmpDir, `faq_${slug}_${Date.now()}.txt`);
+  const filePath = path.join(tmpDir, `faq_scope_${slug}_plus_global_${Date.now()}.txt`);
   fs.writeFileSync(filePath, text, 'utf8');
 
   const uploaded = await openai.files.create({
@@ -771,7 +775,7 @@ async function syncFaqToVectorStoreIfNeeded(faqRows, slug, force = false) {
 
   try { fs.unlinkSync(filePath); } catch {}
 
-  console.log(`✅ VectorStore sync OK | slug=${slug} | hash=${hash} | file_id=${uploaded.id}`);
+  console.log(`✅ VectorStore sync OK | scope="${slug}+global" | hash=${hash} | file_id=${uploaded.id}`);
   return { ok: true, skipped: false, hash, file_id: uploaded.id };
 }
 
@@ -827,11 +831,11 @@ app.all('/api/ask', async (req, res) => {
 
     const data = {};
     for (const [key, variants] of Object.entries(TABLES)) {
-      if (key === 'faq') data[key] = await getAllNoSlug(variants);
+      if (key === 'faq') data[key] = await getFaqBySlugOrGlobal(slug); // ✅ (slug + global)
       else data[key] = await getBySlugMulti(variants, slug);
     }
 
-    // ✅ (A) FAQ strict — prvo (brzo i jeftino)
+    // ✅ (A) FAQ strict — prvo
     if (!isCategoryOrPriceQuery(userMessage)) {
       const faqAnswer = answerFromFAQ_STRICT(userMessage, data.faq);
       if (faqAnswer) return res.json({ ok: true, reply: faqAnswer });
@@ -887,7 +891,7 @@ app.all('/api/ask', async (req, res) => {
   }
 });
 
-/* ===== Admin: ručni sync FAQ -> Vector Store ===== */
+/* ===== Admin: ručni sync FAQ -> Vector Store (scope = slug + global) ===== */
 app.post('/api/admin/sync-faq', async (req, res) => {
   try {
     const token = norm(req.headers['x-sync-token'] || req.query.token || req.body?.token);
@@ -896,12 +900,31 @@ app.post('/api/admin/sync-faq', async (req, res) => {
     }
 
     const slug = normSlug(req.query.slug || DEFAULT_SLUG);
-    const faqRows = await getAllNoSlug(TABLES.faq);
+
+    // ✅ dohvat samo (slug + global)
+    const faqRows = await getFaqBySlugOrGlobal(slug);
 
     const out = await syncFaqToVectorStoreIfNeeded(faqRows, slug, true);
-    res.json({ ok: true, ...out });
+    res.json({ ok: true, scope: `${slug}+global`, ...out });
   } catch (e) {
     console.error('SYNC_FAQ_ERROR', e?.message);
+    res.status(500).json({ ok: false, error: e?.message });
+  }
+});
+
+/* ✅ Admin: test što vector store vraća (za provjeru) */
+app.get('/api/admin/vs-test', async (req, res) => {
+  try {
+    const token = norm(req.headers['x-sync-token'] || req.query.token || req.body?.token);
+    if (VECTOR_SYNC_SECRET && token !== VECTOR_SYNC_SECRET) {
+      return res.status(401).json({ ok: false, error: 'Unauthorized' });
+    }
+    const q = norm(req.query.q || '').trim();
+    if (!q) return res.status(400).json({ ok: false, error: 'Missing q' });
+
+    const vs = await vectorStoreSearch(q);
+    res.json({ ok: true, q, vs });
+  } catch (e) {
     res.status(500).json({ ok: false, error: e?.message });
   }
 });
@@ -910,17 +933,19 @@ app.post('/api/admin/sync-faq', async (req, res) => {
 app.get('/api/debug', async (req, res) => {
   const slug = normSlug(req.query.slug || DEFAULT_SLUG);
   const school = await getSchoolRow(slug);
+
   const data = {};
   for (const [key, variants] of Object.entries(TABLES)) {
-    if (key === 'faq') data[key] = await getAllNoSlug(variants);
+    if (key === 'faq') data[key] = await getFaqBySlugOrGlobal(slug);
     else data[key] = await getBySlugMulti(variants, slug);
   }
+
   const aiSections = extractAIPromptSections(data, slug);
   res.json({ ok: true, slug, school, data, aiSections });
 });
 
 app.get('/api/health', (req, res) => {
-  res.json({ ok: true, status: 'AI agent radi ✅', time: new Date().toISOString() });
+  res.json({ ok: true, status: 'AI agent radi ✅', time: new Date().toISOString(), version: promptVersion });
 });
 
 /* ===== Start ===== */
@@ -935,7 +960,7 @@ async function bootVectorSync() {
     return;
   }
   try {
-    const faqRows = await getAllNoSlug(TABLES.faq);
+    const faqRows = await getFaqBySlugOrGlobal(DEFAULT_SLUG); // ✅ default slug + global
     await syncFaqToVectorStoreIfNeeded(faqRows, DEFAULT_SLUG, false);
   } catch (e) {
     console.warn('VECTOR_SYNC_BOOT_WARN', e?.message);
@@ -943,7 +968,7 @@ async function bootVectorSync() {
 
   setInterval(async () => {
     try {
-      const faqRows = await getAllNoSlug(TABLES.faq);
+      const faqRows = await getFaqBySlugOrGlobal(DEFAULT_SLUG);
       await syncFaqToVectorStoreIfNeeded(faqRows, DEFAULT_SLUG, false);
     } catch (e) {
       console.warn('VECTOR_SYNC_INTERVAL_WARN', e?.message);
